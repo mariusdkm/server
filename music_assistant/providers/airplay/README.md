@@ -115,6 +115,8 @@ only used for devices that do not support it.
 One exception: an AirPlay 2 shairport-sync receiver advertised from this host
 (e.g. a Home Assistant add-on) gets `--protocol airplay2-compat` on Automatic.
 Its nqptp and MA's PTP engine both need UDP 319/320, so the native lane can't work.
+MA's own AirPlay receiver is not affected: it is timed by MA's PTP daemon
+(`--nqptp-compat`, see `ptp_daemon.py`) and filtered out of discovery anyway.
 
 ### Streaming mode (escape hatch)
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from music_assistant_models.enums import EventType
 from music_assistant_models.event import MassEvent
@@ -14,6 +14,15 @@ from music_assistant.providers.airplay_receiver import (
     AirPlayReceiverProvider,
     airplay_receiver_ports,
 )
+from music_assistant.providers.airplay_receiver.helpers import (
+    ShairportSyncCapabilities,
+    get_shairport_sync_capabilities,
+)
+from music_assistant.providers.airplay_receiver.mdns import ServiceRegistration
+from music_assistant.providers.airplay_receiver.provider import _ReceiverDaemon
+
+MODULE = "music_assistant.providers.airplay_receiver.provider"
+HELPERS = "music_assistant.providers.airplay_receiver.helpers"
 
 # --- Port derivation -----------------------------------------------------------
 
@@ -357,3 +366,178 @@ def test_a_fatal_log_line_marks_the_daemon_started() -> None:
     prov._process_shairport_log_line(daemon, "fatal error: Could not bind any listening ports")
 
     assert daemon.started.is_set()
+
+
+# --- AirPlay 2 -----------------------------------------------------------------
+
+
+def _airplay2_provider(*, airplay2: bool, source_ip: str | None = None) -> AirPlayReceiverProvider:
+    """Build a bare provider that can start receivers, in AirPlay 1 or AirPlay 2 mode."""
+    prov = AirPlayReceiverProvider.__new__(AirPlayReceiverProvider)
+    prov.logger = MagicMock()
+    prov.mass = MagicMock()
+    prov.mass.streams.get_source_ip = AsyncMock(return_value=source_ip)
+    prov.config = MagicMock()
+    prov.config.instance_id = "airplay_receiver"
+    prov.config.name = "AirPlay Receiver"
+    prov.manifest = MagicMock(domain="airplay_receiver")
+    prov._daemons = {}
+    prov._ports = {"media_player.kitchen": 7123}
+    prov._audio_format = MagicMock()
+    prov._ptp_daemon = MagicMock() if airplay2 else None
+    prov._setup_shairport_daemon = MagicMock()  # type: ignore[method-assign]
+    return prov
+
+
+def _started(prov: AirPlayReceiverProvider, name: str = "Kitchen") -> _ReceiverDaemon:
+    player = MagicMock(player_id="media_player.kitchen", display_name=name)
+    prov._start_receiver(player, name)
+    return prov._daemons["media_player.kitchen"]
+
+
+async def test_airplay1_receiver_is_pinned_to_classic() -> None:
+    """Without AirPlay 2, the receiver never turns itself into one (service_type "auto")."""
+    prov = _airplay2_provider(airplay2=False)
+    daemon = _started(prov)
+    assert not daemon.smi_name
+    assert daemon.advertiser is None
+    assert await prov._get_service_lines(daemon) == '\tservice_type = "classic";\n'
+
+
+async def test_airplay2_receiver_config() -> None:
+    """An AirPlay 2 receiver is timed by the PTP daemon and advertised by the server."""
+    prov = _airplay2_provider(airplay2=True, source_ip="192.168.1.5")
+    daemon = _started(prov)
+    lines = await prov._get_service_lines(daemon)
+    assert lines.splitlines() == [
+        '\tservice_type = "airplay2";',
+        '\tmdns_backend = "metadata";',
+        f'\tnqptp_shared_memory_interface_name = "{daemon.smi_name}";',
+        f"\tairplay_device_id = 0x{daemon.device_id}L;",
+        '\taddress = "192.168.1.5";',
+    ]
+    assert daemon.advertiser is not None
+
+    # without a bound stream ip, it listens on every address
+    unbound = _airplay2_provider(airplay2=True)
+    assert "address" not in await unbound._get_service_lines(_started(unbound))
+
+
+async def test_airplay2_identity_survives_a_rename() -> None:
+    """IOS keeps knowing a renamed receiver: its device id follows the player, not the name."""
+    prov = _airplay2_provider(airplay2=True)
+    first = _started(prov, "Kitchen")
+    renamed = _started(prov, "Cuisine")
+    assert (renamed.smi_name, renamed.device_id) == (first.smi_name, first.device_id)
+
+    # a valid nqptp interface name: "/" and at most 62 more characters
+    assert first.smi_name.startswith("/ma-")
+    assert len(first.smi_name) <= 63
+    assert "/" not in first.smi_name[1:]
+    # a locally administered, unicast MAC address
+    assert len(first.device_id) == 12
+    first_octet = int(first.device_id[:2], 16)
+    assert first_octet & 0x02
+    assert not first_octet & 0x01
+
+
+async def test_service_registration_is_published() -> None:
+    """A service from shairport-sync goes to the receiver's advertiser."""
+    prov = _airplay2_provider(airplay2=True)
+    daemon = _started(prov)
+    advertiser = MagicMock()
+    advertiser.publish = AsyncMock()
+    daemon.advertiser = advertiser
+    registration = ServiceRegistration("_airplay._tcp", "Kitchen", 7123, {})
+
+    mass = MagicMock()
+    prov.mass = mass
+    prov._on_metadata_update(daemon, {"mdns_service": registration})
+
+    mass.create_task.assert_called_once()
+    await mass.create_task.call_args.args[0]
+    advertiser.publish.assert_awaited_once_with(registration)
+
+
+def _enable_provider(*, ready: bool, nqptp: bool) -> tuple[AirPlayReceiverProvider, MagicMock]:
+    prov = AirPlayReceiverProvider.__new__(AirPlayReceiverProvider)
+    prov.logger = MagicMock()
+    prov.mass = MagicMock()
+    prov.config = MagicMock()
+    prov.config.instance_id = "airplay_receiver"
+    prov._shairport_bin = "/bin/shairport-sync"
+    ptp_daemon = MagicMock(nqptp_active=nqptp)
+    ptp_daemon.acquire = AsyncMock()
+    ptp_daemon.release = AsyncMock()
+    ptp_daemon.wait_ready = AsyncMock(return_value=ready)
+    return prov, ptp_daemon
+
+
+async def _enable(
+    capabilities: ShairportSyncCapabilities, *, ready: bool = True, nqptp: bool = True
+) -> tuple[bool, AirPlayReceiverProvider, MagicMock]:
+    prov, ptp_daemon = _enable_provider(ready=ready, nqptp=nqptp)
+    with (
+        patch(f"{MODULE}.get_shairport_sync_capabilities", AsyncMock(return_value=capabilities)),
+        patch(f"{MODULE}.PtpDaemon.get", return_value=ptp_daemon),
+    ):
+        enabled = await prov._enable_airplay2()
+    return enabled, prov, ptp_daemon
+
+
+async def test_airplay2_enabled_when_everything_is_there() -> None:
+    """AirPlay 2 runs with a capable binary and a daemon that stands in for nqptp."""
+    enabled, prov, ptp_daemon = await _enable(ShairportSyncCapabilities(True, True))
+    assert enabled
+    assert prov._ptp_daemon is ptp_daemon
+    ptp_daemon.acquire.assert_awaited_once_with("airplay_receiver", prov.logger, nqptp_compat=True)
+
+
+async def test_airplay2_falls_back_without_a_capable_binary() -> None:
+    """A shairport-sync without AirPlay 2 or the metadata backend stays AirPlay 1."""
+    for capabilities in (
+        ShairportSyncCapabilities(False, True),
+        ShairportSyncCapabilities(True, False),
+    ):
+        enabled, prov, ptp_daemon = await _enable(capabilities)
+        assert not enabled
+        assert prov._ptp_daemon is None
+        ptp_daemon.acquire.assert_not_awaited()
+
+
+async def test_airplay2_falls_back_without_nqptp_compat() -> None:
+    """A daemon that is not ready, or not standing in for nqptp, is released again."""
+    for ready, nqptp in ((False, False), (True, False)):
+        enabled, prov, ptp_daemon = await _enable(
+            ShairportSyncCapabilities(True, True), ready=ready, nqptp=nqptp
+        )
+        assert not enabled
+        assert prov._ptp_daemon is None
+        ptp_daemon.release.assert_awaited_once_with("airplay_receiver")
+
+
+async def test_shairport_sync_capabilities() -> None:
+    """AirPlay 2 and the metadata mDNS backend are read from the binary itself."""
+    usage = (
+        b"Usage: shairport-sync [options...]\n"
+        b"Available mDNS backends: \n    tinysvcmdns\n    metadata\n\n"
+        b"Available audio backends: \n    pipe\n"
+    )
+    version = b"5.6.2-AirPlay2-smi11-OpenSSL-tinysvcmdns-pipe-metadata\n"
+    outputs = {"-V": (0, version), "-h": (0, usage)}
+
+    async def check_output(_binary: str, arg: str) -> tuple[int, bytes]:
+        return outputs[arg]
+
+    with patch(f"{HELPERS}.check_output", side_effect=check_output):
+        assert (await get_shairport_sync_capabilities("ssp")).can_receive_airplay2
+
+        outputs["-h"] = (0, usage.replace(b"    metadata\n", b""))
+        assert not (await get_shairport_sync_capabilities("ssp")).mdns_metadata
+
+        # "metadata" elsewhere in the usage text is not the backend
+        outputs["-h"] = (0, usage.replace(b"    metadata\n", b"") + b"    metadata\n")
+        assert not (await get_shairport_sync_capabilities("ssp")).mdns_metadata
+
+        outputs["-V"] = (0, b"5.6.2-OpenSSL-tinysvcmdns-pipe-metadata\n")
+        assert not (await get_shairport_sync_capabilities("ssp")).airplay2
