@@ -12,7 +12,9 @@ from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
+from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import (
+    ConfigEntryType,
     ContentType,
     EventType,
     ImageType,
@@ -60,13 +62,17 @@ from music_assistant.helpers.util import (
 )
 from music_assistant.models.media_capabilities import SourceControlValue
 from music_assistant.models.plugin import PluginProvider
-from music_assistant.providers.airplay_receiver.helpers import get_shairport_sync_binary
+from music_assistant.providers.airplay.ptp_daemon import PtpDaemon
+from music_assistant.providers.airplay_receiver.helpers import (
+    get_shairport_sync_binary,
+    get_shairport_sync_capabilities,
+)
 from music_assistant.providers.airplay_receiver.metadata import MdnsService, MetadataReader
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
-    from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
+    from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.event import MassEvent
     from music_assistant_models.provider import ProviderManifest
 
@@ -74,6 +80,8 @@ if TYPE_CHECKING:
     from music_assistant.models.player import Player
 
 SUPPORTED_FEATURES = {ProviderFeature.AUDIO_SOURCE}
+
+CONF_AIRPLAY2 = "airplay2"
 
 # seconds the silence nudge waits for the audio pipe's consumer to reattach
 AUDIO_PIPE_READER_TIMEOUT = 1.0
@@ -159,6 +167,9 @@ class _ReceiverDaemon:
     # service type: an AirPlay 2 build hands over _airplay._tcp next to _raop._tcp
     mdns_infos: dict[str, AsyncServiceInfo] = field(default_factory=dict)
     mdns_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # AirPlay 2 only: the clock interface name and device id (both stable across renames)
+    smi_name: str = ""
+    device_id: str = ""
 
     def cover_art_path(self, img_hash: str) -> str:
         """
@@ -175,6 +186,9 @@ class AirPlayReceiverProvider(PluginProvider):
     """Implementation of an AirPlay Receiver Plugin."""
 
     reload_on_streams_network_change = True
+    # the shared PTP daemon, held while receiving AirPlay 2
+    _ptp_daemon: PtpDaemon | None = None
+    _unsub_timeline_rate: Callable[[], None] | None = None
 
     def __init__(
         self, mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
@@ -232,11 +246,20 @@ class AirPlayReceiverProvider(PluginProvider):
                 self.mass, cast("list[str]", self.get_config_value(CONF_CONNECTED_PLAYERS) or [])
             ),
             create_publish_name_template_entry(self.get_config_value(CONF_PUBLISH_NAME_TEMPLATE)),
+            ConfigEntry(
+                key=CONF_AIRPLAY2,
+                type=ConfigEntryType.BOOLEAN,
+                default_value=False,
+                required=False,
+                advanced=True,
+            ),
         )
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
         self._shairport_bin = await get_shairport_sync_binary()
+        if self.get_config_value(CONF_AIRPLAY2) and not await self._enable_airplay2():
+            self.logger.warning("Receiving AirPlay 1 only")
 
     async def loaded_in_mass(self) -> None:
         """Start the receiver daemons and follow the connected players' lifecycle."""
@@ -262,6 +285,12 @@ class AirPlayReceiverProvider(PluginProvider):
             # drop the standing source entries from the players' cached source lists
             for daemon in daemons:
                 self.mass.players.trigger_player_update(daemon.player_id)
+        if self._unsub_timeline_rate is not None:
+            self._unsub_timeline_rate()
+            self._unsub_timeline_rate = None
+        if self._ptp_daemon is not None:
+            await self._ptp_daemon.release(self.instance_id)
+            self._ptp_daemon = None
 
     async def get_audio_sources(self) -> list[AudioSource]:
         """Return the AudioSources this plugin currently exposes."""
@@ -583,6 +612,11 @@ class AirPlayReceiverProvider(PluginProvider):
             # no title until a track plays, so the source shows by its own name
             stream_metadata=StreamMetadata(title=""),
         )
+        if self._ptp_daemon is not None:
+            digest = hashlib.md5(receiver_key.encode(), usedforsecurity=False).digest()
+            daemon.smi_name = f"/ma-{digest.hex()[:12]}"
+            # a locally administered unicast MAC, so it cannot clash with real hardware
+            daemon.device_id = bytes([(digest[0] | 0x02) & 0xFE, *digest[1:6]]).hex().upper()
         self._daemons[player_id] = daemon
         self._setup_shairport_daemon(daemon)
 
@@ -813,6 +847,9 @@ class AirPlayReceiverProvider(PluginProvider):
         config_content = config_content.replace("{METADATA_PIPE}", daemon.metadata_pipe.path)
         config_content = config_content.replace("{AUDIO_PIPE}", daemon.audio_pipe.path)
         config_content = config_content.replace("{PORT}", str(daemon.port))
+        config_content = config_content.replace(
+            "{SERVICE_LINES}", await self._get_service_lines(daemon)
+        )
 
         # Set default volume based on the connected player's current volume if available
         # Convert player volume (0-100) to AirPlay volume (-30.0 to 0.0 dB)
@@ -857,6 +894,9 @@ class AirPlayReceiverProvider(PluginProvider):
                 ips: tuple[str, ...] = (ip,)
             else:
                 ips = await get_publish_ip_candidates(include_ipv6=True)
+            if daemon.smi_name:
+                # the PTP daemon follows AirPlay 2 senders over IPv4 only
+                ips = tuple(address for address in ips if ":" not in address) or ips
             aiozc = self.mass.discovery.aiozc
             try:
                 info = AsyncServiceInfo(
@@ -910,12 +950,11 @@ class AirPlayReceiverProvider(PluginProvider):
         outer consumer make forward progress so the queue's cmd_stop can
         close the stream cleanly.
 
-        We write enough silence to ensure ffmpeg outputs at least one chunk.
-        PCM_S16LE format: 2 bytes per sample, 2 channels, 44100 Hz
-        Writing 1 second of silence = 44100 * 2 * 2 = 176400 bytes
+        We write enough silence (1 second) to ensure ffmpeg outputs at least one chunk.
         """
         self.logger.debug("Writing silence to audio pipe to unblock stream")
-        silence = b"\x00" * 176400  # 1 second of silence in PCM_S16LE stereo 44.1kHz
+        fmt = self._decoded_audio_format
+        silence = b"\x00" * (fmt.sample_rate * fmt.channels * fmt.bit_depth // 8)
         # the consumer reopens the pipe shortly after shairport-sync drops it, so the
         # nudge waits for it to come back instead of landing in that gap
         if not await daemon.audio_pipe.wait_for_reader(AUDIO_PIPE_READER_TIMEOUT):
@@ -1219,3 +1258,49 @@ class AirPlayReceiverProvider(PluginProvider):
                     remotely_accessible=False,
                 )
                 daemon.stream_metadata.image_url = self.mass.metadata.get_image_url(image)
+
+    async def _enable_airplay2(self) -> bool:
+        """Prepare receiving AirPlay 2; return False when it is not possible here."""
+        assert self._shairport_bin
+        capabilities = await get_shairport_sync_capabilities(self._shairport_bin)
+        if not capabilities.can_receive_airplay2:
+            self.logger.warning(
+                "This shairport-sync cannot receive AirPlay 2 for Music Assistant "
+                "(needs AirPlay 2 and the metadata mDNS backend)"
+            )
+            return False
+        # The shared PTP daemon owns UDP 319/320 and stands in for nqptp.
+        ptp_daemon = PtpDaemon.get(self.mass)
+        await ptp_daemon.acquire(self.instance_id, self.logger, nqptp_compat=True)
+        if await ptp_daemon.wait_ready() and ptp_daemon.nqptp_active:
+            self._ptp_daemon = ptp_daemon
+            # The daemon restarts on a new rate of the timeline, which drops the clock
+            # shairport-sync follows, so the rate waits until no AirPlay 2 client streams.
+            self._unsub_timeline_rate = self.mass.timeline_clock.add_rate_listener(
+                pinned=self._receiving_airplay2
+            )
+            return True
+        self.logger.warning("The PTP daemon cannot time AirPlay 2 reception")
+        await ptp_daemon.release(self.instance_id)
+        return False
+
+    def _receiving_airplay2(self) -> bool:
+        """Return whether an AirPlay 2 client streams to one of the receivers."""
+        return any(daemon.smi_name and daemon.client_active for daemon in self._daemons.values())
+
+    async def _get_service_lines(self, daemon: _ReceiverDaemon) -> str:
+        """Build the shairport-sync ``general`` lines selecting AirPlay 1 or AirPlay 2."""
+        if self._ptp_daemon is None or not daemon.smi_name:
+            # never "auto": that turns into AirPlay 2 whenever an nqptp is around, and
+            # classic advertises only the _raop._tcp service
+            return '\tservice_type = "classic";\n'
+        lines = [
+            # fail instead of falling back to classic AirPlay on the AirPlay 2 port
+            'service_type = "airplay2";',
+            f'nqptp_shared_memory_interface_name = "{daemon.smi_name}";',
+            f"airplay_device_id = 0x{daemon.device_id}L;",
+        ]
+        # the PTP daemon follows senders over IPv4 only
+        if bind_ip := await self.mass.streams.get_source_ip():
+            lines.append(f'address = "{bind_ip}";')
+        return "".join(f"\t{line}\n" for line in lines)
