@@ -7,6 +7,10 @@
     "publish_name_template": {
       "label": "[%key:common::config_entries::publish_name_template::label%]",
       "description": "How each receiver shown in the AirPlay device list is named, based on the connected player's name."
+    },
+    "airplay2": {
+      "label": "Receive AirPlay 2",
+      "description": "Advertise the receivers as AirPlay 2 devices instead of AirPlay 1. Needs the AirPlay provider's PTP clock daemon, so it is unavailable when another nqptp runs on this host; the receivers then stay AirPlay 1."
     }
   },
   "manifest": {

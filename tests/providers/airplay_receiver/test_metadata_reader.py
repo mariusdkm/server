@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import pathlib
@@ -12,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from music_assistant.providers.airplay_receiver.mdns import ServiceRegistration
 from music_assistant.providers.airplay_receiver.metadata import MetadataReader
 
 
@@ -133,3 +135,48 @@ async def test_reader_keeps_pipe_attached_across_restart(
         await _wait_for(lambda: updates[-1:] == [{"play_state": "stopped"}], timeout=5.0)
     finally:
         await reader.stop()
+
+
+def _xml_item(item_type: str, code: str, data: str) -> str:
+    """Build a metadata item the way shairport-sync writes it to the pipe."""
+    payload = base64.b64encode(data.encode()).decode()
+    return (
+        f"<item><type>{item_type.encode().hex()}</type><code>{code.encode().hex()}</code>"
+        f'<length>{len(data)}</length>\n<data encoding="base64">\n{payload}</data></item>\n'
+    )
+
+
+async def test_service_registration_delivered(pipe_path: str) -> None:
+    """A service from the "metadata" mDNS backend is delivered for publishing."""
+    updates: list[dict[str, Any]] = []
+    reader = MetadataReader(pipe_path, logging.getLogger("test"), updates.append)
+    await reader.start()
+    try:
+        await _write_marker(
+            pipe_path,
+            _xml_item("ssnc", "svrg", "service=_airplay._tcp\nname=Kitchen\nport=7123\ntxt=a=1\n"),
+        )
+        await _wait_for(lambda: bool(updates))
+        assert updates == [
+            {"mdns_service": ServiceRegistration("_airplay._tcp", "Kitchen", 7123, {"a": "1"})}
+        ]
+    finally:
+        await reader.stop()
+
+
+async def test_malformed_service_registration_ignored() -> None:
+    """A service that cannot be advertised is not passed on."""
+    updates: list[dict[str, Any]] = []
+    reader = MetadataReader("/nonexistent", logging.getLogger("test"), updates.append)
+    await reader._process_metadata_item("ssnc", "svup", "name=Kitchen\n")
+    assert updates == []
+
+
+async def test_airplay2_resume_clears_pause() -> None:
+    """AirPlay 2 resumes with 'pres' where AirPlay 1 sends 'prsm'."""
+    reader = MetadataReader("/nonexistent", logging.getLogger("test"), None)
+    for code in ("prsm", "pres"):  # codespell:ignore pres
+        await reader._process_metadata_item("ssnc", "paus", "")
+        assert reader._current_metadata["paused"] is True
+        await reader._process_metadata_item("ssnc", code, "")
+        assert reader._current_metadata["paused"] is False
