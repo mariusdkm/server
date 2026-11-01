@@ -381,7 +381,7 @@ class MetadataReader:
                 self.on_metadata({"elapsed_time": self._current_metadata["elapsed_time"]})
         elif code == "paus":  # Paused
             self._current_metadata["paused"] = True
-        elif code == "prsm":  # Playing/resumed
+        elif code in ("prsm", "pres"):  # Resumed (AirPlay 1 / 2)  # codespell:ignore pres
             self._current_metadata["paused"] = False
         elif code == "svrg":  # mDNS service to publish ("metadata" mDNS backend)
             if self.on_metadata and (registration := parse_service_payload(data)):
