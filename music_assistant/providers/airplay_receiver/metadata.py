@@ -12,6 +12,7 @@ from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 from music_assistant.constants import VERBOSE_LOG_LEVEL
+from music_assistant.providers.airplay_receiver.mdns import parse_service_payload
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -370,8 +371,11 @@ class MetadataReader:
                 self.on_metadata({"elapsed_time": self._current_metadata["elapsed_time"]})
         elif code == "paus":  # Paused
             self._current_metadata["paused"] = True
-        elif code == "prsm":  # Playing/resumed
+        elif code in ("prsm", "pres"):  # Resumed (AirPlay 1 / 2)  # codespell:ignore pres
             self._current_metadata["paused"] = False
+        elif code in ("svrg", "svup"):  # mDNS service to publish ("metadata" mDNS backend)
+            if self.on_metadata and (registration := parse_service_payload(data)):
+                self.on_metadata({"mdns_service": registration})
 
     def _parse_volume(self, data: str) -> None:
         """
