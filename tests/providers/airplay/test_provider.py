@@ -1,6 +1,5 @@
 """Unit tests for the AirPlay provider."""
 
-import asyncio
 import logging
 import time
 from contextlib import AbstractContextManager
@@ -14,13 +13,10 @@ from music_assistant_models.enums import PlaybackState
 from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.providers.airplay.constants import (
     AIRPLAY_COLD_GROUP_START_LEAD_MS,
-    PTP_DAEMON_WARN_BURST,
-    PTP_DAEMON_WARN_WINDOW,
     AirPlayRemoteCommand,
     ClockReadiness,
     StreamingProtocol,
 )
-from music_assistant.providers.airplay.helpers import CLI_CLOCK_OFFSET_NS
 from music_assistant.providers.airplay.player import AirPlayPlayer
 from music_assistant.providers.airplay.provider import ENV_PYATV_DEBUG, AirPlayProvider
 from music_assistant.providers.airplay.sendspin_bridge import (
@@ -33,14 +29,6 @@ from music_assistant.providers.airplay_receiver import airplay_receiver_ports
 
 INSTANCE_ID = "airplay"
 START_UNIX_MS = 1_750_000_000_000
-
-# A representative readiness line emitted by `cliairplay --ptp-daemon` on the
-# real device (from a live DEBUG log) once it has bound 319/320 and opened its
-# control channel.
-DAEMON_UP_LINE = (
-    "[15:44:56.101] ap2_ptp_run_daemon:1467 [PTP] daemon up: engine on 319/320, "
-    "clock in /cliairplay-ptp, control on 127.0.0.1:9010"
-)
 
 
 def _make_provider() -> AirPlayProvider:
@@ -107,31 +95,6 @@ def test_remote_pause_keeps_normal_airplay_routing() -> None:
     players.cmd_pause.assert_called_once_with(airplay_player.player_id)
 
 
-async def test_unload_awaits_cancelled_ptp_stdout_reader() -> None:
-    """Provider unload waits for its cancelled PTP stdout reader before process cleanup."""
-    prov = AirPlayProvider.__new__(AirPlayProvider)
-    prov.mass = MagicMock()
-    prov._ptp_daemon_ready = None
-    prov._ptp_daemon = None
-    prov._dacp_server = MagicMock()
-    prov._dacp_server.__bool__.return_value = False
-    prov._dacp_info = MagicMock()
-    prov._dacp_info.__bool__.return_value = False
-    reader_started = asyncio.Event()
-
-    async def _stdout_reader() -> None:
-        reader_started.set()
-        await asyncio.Event().wait()
-
-    reader_task = asyncio.create_task(_stdout_reader())
-    prov._ptp_daemon_stdout_task = reader_task
-    await reader_started.wait()
-
-    await prov.unload()
-
-    assert reader_task.cancelled()
-
-
 # --- Shared PTP clock daemon: readiness signal ---------------------------------
 
 
@@ -140,162 +103,7 @@ def _ptp_provider() -> AirPlayProvider:
     prov = AirPlayProvider.__new__(AirPlayProvider)
     prov.logger = logging.getLogger("test.airplay.provider")
     prov._ptp_daemon = None
-    prov._ptp_daemon_ready = None
     return prov
-
-
-def _live_ptp_daemon() -> MagicMock:
-    """Build a process mock that remains alive until its wait task is cancelled."""
-    daemon = MagicMock()
-    daemon.closed = False
-    daemon.returncode = None
-
-    async def _wait_forever() -> int:
-        await asyncio.Event().wait()
-        return 0
-
-    daemon.wait = AsyncMock(side_effect=_wait_forever)
-    return daemon
-
-
-async def test_ptp_daemon_spawn_advertises_dacp_identity() -> None:
-    """The spawned PTP daemon is handed the provider's DACP id as its clock identity."""
-    prov = _ptp_provider()
-    prov.dacp_id = "AABBCCDD11223344"
-    prov.mass = MagicMock()
-    prov.mass.streams.get_source_ip = AsyncMock(return_value=None)
-    # The spawn mirrors the live logger level into --debug flags; pin the
-    # level so suite ordering (other tests raising verbosity) cannot leak
-    # extra args into this assertion.
-    prov.logger.setLevel(logging.INFO)
-
-    def _consume_task(coro: object) -> MagicMock:
-        if asyncio.iscoroutine(coro):
-            coro.close()
-        return MagicMock()
-
-    prov.mass.create_task.side_effect = _consume_task
-
-    with (
-        patch(
-            "music_assistant.providers.airplay.provider.get_cli_binary",
-            AsyncMock(return_value="/bin/cliairplay"),
-        ),
-        patch("music_assistant.providers.airplay.provider.AsyncProcess") as process_cls,
-    ):
-        process_cls.return_value.start = AsyncMock(return_value=None)
-        await prov._start_ptp_daemon()
-
-    assert process_cls.call_args.args[0] == [
-        "/bin/cliairplay",
-        "--ptp-daemon",
-        "--dacp",
-        "AABBCCDD11223344",
-        "--clock-offset-ns",
-        str(CLI_CLOCK_OFFSET_NS),
-    ]
-
-
-async def test_ptp_daemon_spawn_pins_operator_configured_interface() -> None:
-    """One daemon serves every player, so only an explicit operator pin narrows it."""
-    prov = _ptp_provider()
-    prov.dacp_id = "AABBCCDD11223344"
-    prov.mass = MagicMock()
-    prov.mass.streams.get_source_ip = AsyncMock(return_value="192.168.1.5")
-    prov.logger.setLevel(logging.INFO)
-
-    def _consume_task(coro: object) -> MagicMock:
-        if asyncio.iscoroutine(coro):
-            coro.close()
-        return MagicMock()
-
-    prov.mass.create_task.side_effect = _consume_task
-
-    with (
-        patch(
-            "music_assistant.providers.airplay.provider.get_cli_binary",
-            AsyncMock(return_value="/bin/cliairplay"),
-        ),
-        patch("music_assistant.providers.airplay.provider.AsyncProcess") as process_cls,
-    ):
-        process_cls.return_value.start = AsyncMock(return_value=None)
-        await prov._start_ptp_daemon()
-
-    args = process_cls.call_args.args[0]
-    assert args[args.index("--if") + 1] == "192.168.1.5"
-    prov.mass.streams.get_source_ip.assert_awaited_once_with()
-
-
-async def test_ptp_daemon_spawn_quiet_at_debug_level() -> None:
-    """A normal debug session keeps the daemon quiet (no per-packet tracing)."""
-    prov = _ptp_provider()
-    prov.dacp_id = "AABBCCDD11223344"
-    prov.mass = MagicMock()
-    prov.mass.streams.get_source_ip = AsyncMock(return_value=None)
-    prov.logger.setLevel(logging.DEBUG)
-
-    def _consume_task(coro: object) -> MagicMock:
-        if asyncio.iscoroutine(coro):
-            coro.close()
-        return MagicMock()
-
-    prov.mass.create_task.side_effect = _consume_task
-
-    with (
-        patch(
-            "music_assistant.providers.airplay.provider.get_cli_binary",
-            AsyncMock(return_value="/bin/cliairplay"),
-        ),
-        patch("music_assistant.providers.airplay.provider.AsyncProcess") as process_cls,
-    ):
-        process_cls.return_value.start = AsyncMock(return_value=None)
-        await prov._start_ptp_daemon()
-
-    assert "--debug" not in process_cls.call_args.args[0]
-
-
-async def test_ptp_daemon_spawn_traces_at_verbose_level() -> None:
-    """The daemon's per-packet trace needs verbose logging AND the opt-in toggle."""
-    prov = _ptp_provider()
-    prov.dacp_id = "AABBCCDD11223344"
-    prov.mass = MagicMock()
-    prov.mass.streams.get_source_ip = AsyncMock(return_value=None)
-    prov.logger.setLevel(VERBOSE_LOG_LEVEL)
-    prov.config = MagicMock()
-    prov.config.get_value = MagicMock(return_value=True)
-
-    def _consume_task(coro: object) -> MagicMock:
-        if asyncio.iscoroutine(coro):
-            coro.close()
-        return MagicMock()
-
-    prov.mass.create_task.side_effect = _consume_task
-
-    with (
-        patch(
-            "music_assistant.providers.airplay.provider.get_cli_binary",
-            AsyncMock(return_value="/bin/cliairplay"),
-        ),
-        patch("music_assistant.providers.airplay.provider.AsyncProcess") as process_cls,
-    ):
-        process_cls.return_value.start = AsyncMock(return_value=None)
-        await prov._start_ptp_daemon()
-
-    assert process_cls.call_args.args[0][-2:] == ["--debug", "10"]
-
-    # Without the opt-in the daemon stays quiet even on a verbose session
-    # (its ~10 lines/s timing trace would otherwise flood every verbose log).
-    prov.config.get_value = MagicMock(return_value=False)
-    with (
-        patch(
-            "music_assistant.providers.airplay.provider.get_cli_binary",
-            AsyncMock(return_value="/bin/cliairplay"),
-        ),
-        patch("music_assistant.providers.airplay.provider.AsyncProcess") as process_cls,
-    ):
-        process_cls.return_value.start = AsyncMock(return_value=None)
-        await prov._start_ptp_daemon()
-    assert "--debug" not in process_cls.call_args.args[0]
 
 
 def test_pyatv_logging_quiet_at_debug_level() -> None:
@@ -331,114 +139,11 @@ def test_pyatv_logging_traces_with_opt_in(monkeypatch: pytest.MonkeyPatch) -> No
     assert logging.getLogger("pyatv").level == logging.DEBUG
 
 
-def test_ptp_daemon_ready_event_set_on_daemon_up_line() -> None:
-    """The readiness event is set when the daemon prints its 'daemon up' line."""
-    prov = _ptp_provider()
-    prov._ptp_daemon_ready = asyncio.Event()
-
-    prov._handle_ptp_daemon_line(DAEMON_UP_LINE)
-
-    assert prov._ptp_daemon_ready.is_set()
-
-
-def test_ptp_daemon_line_without_marker_leaves_event_clear() -> None:
-    """A normal daemon log line does not trip the readiness event."""
-    prov = _ptp_provider()
-    prov._ptp_daemon_ready = asyncio.Event()
-
-    prov._handle_ptp_daemon_line(
-        "[15:44:56.101] ap2_ptp_engine_start:1173 [PTP] Engine started on UDP 319/320"
-    )
-
-    assert not prov._ptp_daemon_ready.is_set()
-
-
-def test_ptp_daemon_line_handler_tolerates_no_event() -> None:
-    """The line handler is a no-op for readiness before any daemon has started."""
-    prov = _ptp_provider()  # _ptp_daemon_ready is None
-    # Must not raise even when the readiness gate does not exist yet.
-    prov._handle_ptp_daemon_line(DAEMON_UP_LINE)
-
-
-def test_ptp_daemon_problem_lines_are_rate_limited(caplog: pytest.LogCaptureFixture) -> None:
-    """A repeating trace line matching a marker must not fill the log at WARNING."""
-    prov = _ptp_provider()
-    trace = "[15:44:56.101] [PTP] slave offset seq=7 error=0.000012"
-
-    with caplog.at_level(logging.WARNING):
-        for _ in range(PTP_DAEMON_WARN_BURST + 20):
-            prov._handle_ptp_daemon_line(trace)
-
-    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
-    assert len(warnings) == PTP_DAEMON_WARN_BURST
-
-
-def test_ptp_daemon_reports_what_it_suppressed(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The count of suppressed lines is reported once the window rolls over."""
-    prov = _ptp_provider()
-    trace = "[15:44:56.101] [PTP] slave offset seq=7 error=0.000012"
-    clock = 1000.0
-    monkeypatch.setattr("music_assistant.providers.airplay.provider.time.monotonic", lambda: clock)
-
-    with caplog.at_level(logging.WARNING):
-        for _ in range(PTP_DAEMON_WARN_BURST + 3):
-            prov._handle_ptp_daemon_line(trace)
-        caplog.clear()
-        clock += PTP_DAEMON_WARN_WINDOW + 1
-        prov._handle_ptp_daemon_line(trace)
-
-    messages = [record.getMessage() for record in caplog.records]
-    assert any("3 further problem line(s) were suppressed" in message for message in messages)
-    # and the window reopens for real problems
-    assert any(message.endswith(trace) for message in messages)
-
-
-def test_ptp_daemon_warn_window_runs_from_its_first_line(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """time.monotonic() counts from boot, so a server started early must still get a full window."""
-    prov = _ptp_provider()
-    trace = "[15:44:56.101] [PTP] slave offset seq=7 error=0.000012"
-    clock = 5.0  # five seconds of uptime
-    monkeypatch.setattr("music_assistant.providers.airplay.provider.time.monotonic", lambda: clock)
-    for _ in range(PTP_DAEMON_WARN_BURST + 2):
-        prov._handle_ptp_daemon_line(trace)
-
-    # 56s into the window, so it must not have rolled over yet
-    clock += PTP_DAEMON_WARN_WINDOW - 4
-    caplog.clear()
-    with caplog.at_level(logging.WARNING):
-        prov._handle_ptp_daemon_line(trace)
-
-    assert caplog.text == ""
-
-
-def test_ptp_daemon_restart_gets_a_fresh_warning_budget(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A replacement daemon's startup failure must not be eaten by the old one's budget."""
-    prov = _ptp_provider()
-    for _ in range(PTP_DAEMON_WARN_BURST + 2):
-        prov._handle_ptp_daemon_line("[15:44:56.101] [PTP] slave offset seq=7 error=0.000012")
-
-    caplog.clear()
-    with caplog.at_level(logging.WARNING):
-        prov._reset_ptp_daemon_warn_budget()
-        prov._handle_ptp_daemon_line("[15:44:57.002] [PTP] Cannot bind UDP 319: Permission denied")
-
-    messages = [record.getMessage() for record in caplog.records]
-    assert any("2 further problem line(s) from the previous daemon" in m for m in messages)
-    assert any("Cannot bind UDP 319" in m for m in messages)
-
-
 async def test_diagnostics_report_daemon_readiness_and_per_stream_route() -> None:
     """A live daemon that never bound its ports must not read as healthy timing."""
     prov = _ptp_provider()
     prov._dacp_server = MagicMock(is_serving=MagicMock(return_value=True))
-    prov._ptp_daemon = _live_ptp_daemon()
-    prov._ptp_daemon_ready = asyncio.Event()  # spawned, never reported ready
+    prov._ptp_daemon = MagicMock(running=True, ready=False)  # spawned, never reported ready
     ntp_player = MagicMock(protocol=StreamingProtocol.AIRPLAY2)
     ntp_player.stream = MagicMock(running=True, active_route="AirPlay 2 (buffered, NTP)")
     raop_player = MagicMock(protocol=StreamingProtocol.RAOP)
@@ -452,108 +157,24 @@ async def test_diagnostics_report_daemon_readiness_and_per_stream_route() -> Non
     assert diagnostics["streams_by_route"] == {"AirPlay 2 (buffered, NTP)": 1, "RAOP": 1}
 
 
-async def test_ptp_daemon_bind_failure_degrades_without_restart() -> None:
-    """
-    Verify a privileged-port bind failure leaves streams on NTP timing.
-
-    The provider must clear readiness without restarting an immediate bind failure.
-    """
+async def test_ptp_daemon_state_without_daemon() -> None:
+    """Before the provider holds the shared daemon, nothing is running or ready."""
     prov = _ptp_provider()
-    daemon = MagicMock()
-    daemon.wait = AsyncMock(return_value=2)
-    ready = asyncio.Event()
-    ready.set()
-    prov.logger = MagicMock()
+    assert not prov.ptp_daemon_running
+    assert not prov.ptp_daemon_ready
+    assert await prov.wait_ptp_daemon_ready(timeout=0) is False
+
+
+async def test_ptp_daemon_state_is_delegated_to_the_shared_daemon() -> None:
+    """The provider reports and waits on the server's shared daemon."""
+    prov = _ptp_provider()
+    daemon = MagicMock(running=True, ready=True)
+    daemon.wait_ready = AsyncMock(return_value=True)
     prov._ptp_daemon = daemon
-    prov._ptp_daemon_ready = ready
-    prov._ptp_daemon_stop_requested = False
-    prov._ptp_daemon_started = time.monotonic()
-    prov._ptp_daemon_restarted = False
-
-    with patch.object(prov, "_start_ptp_daemon", new_callable=AsyncMock) as restart:
-        await prov._ptp_daemon_monitor(daemon)
-
-    restart.assert_not_awaited()
-    assert not await prov.wait_ptp_daemon_ready(timeout=0)
-    warning = prov.logger.warning
-    warning.assert_called_once()
-    assert warning.call_args.args[1] == 2
-    assert "CAP_NET_BIND_SERVICE" in warning.call_args.args[0]
-
-
-async def test_wait_ptp_daemon_ready_true_when_signalled() -> None:
-    """wait_ptp_daemon_ready returns True once readiness has been signalled."""
-    prov = _ptp_provider()
-    prov._ptp_daemon = _live_ptp_daemon()
-    prov._ptp_daemon_ready = asyncio.Event()
-    prov._ptp_daemon_ready.set()
-
-    assert await prov.wait_ptp_daemon_ready(timeout=0.1) is True
-
-
-async def test_wait_ptp_daemon_ready_false_without_daemon() -> None:
-    """With no daemon ever started (event is None), readiness is False."""
-    prov = _ptp_provider()
-
-    assert await prov.wait_ptp_daemon_ready(timeout=0.1) is False
-
-
-async def test_wait_ptp_daemon_ready_times_out_when_never_ready() -> None:
-    """A spawned-but-not-ready daemon yields False after the bounded wait."""
-    prov = _ptp_provider()
-    prov._ptp_daemon = _live_ptp_daemon()
-    prov._ptp_daemon_ready = asyncio.Event()  # but readiness never signalled
-
-    assert await prov.wait_ptp_daemon_ready(timeout=0.05) is False
-
-
-async def test_wait_ptp_daemon_ready_false_fast_when_daemon_gone() -> None:
-    """A daemon that has exited short-circuits to False without burning the timeout."""
-    prov = _ptp_provider()
-    prov._ptp_daemon = None  # process has exited
-    prov._ptp_daemon_ready = asyncio.Event()  # stale gate left un-set
-
-    started = time.monotonic()
-    assert await prov.wait_ptp_daemon_ready(timeout=5.0) is False
-    assert time.monotonic() - started < 1.0
-
-
-async def test_wait_ptp_daemon_ready_false_fast_when_process_exited() -> None:
-    """An exited process object cannot keep readiness waiting on a stale event."""
-    prov = _ptp_provider()
-    prov._ptp_daemon = MagicMock(closed=True, returncode=1)
-    prov._ptp_daemon_ready = asyncio.Event()
-
-    started = time.monotonic()
-    assert await prov.wait_ptp_daemon_ready(timeout=5.0) is False
-    assert time.monotonic() - started < 1.0
-
-
-async def test_wait_ptp_daemon_ready_rejects_stale_ready_event() -> None:
-    """A stale readiness signal cannot make an exited daemon appear usable."""
-    prov = _ptp_provider()
-    prov._ptp_daemon = MagicMock(closed=True, returncode=1)
-    prov._ptp_daemon_ready = asyncio.Event()
-    prov._ptp_daemon_ready.set()
-
-    assert await prov.wait_ptp_daemon_ready(timeout=0.1) is False
-
-
-async def test_wait_ptp_daemon_ready_signalled_during_wait() -> None:
-    """A readiness signal that arrives while waiting resolves the wait to True."""
-    prov = _ptp_provider()
-    prov._ptp_daemon = _live_ptp_daemon()
-    prov._ptp_daemon_ready = asyncio.Event()
-
-    async def _signal_soon() -> None:
-        await asyncio.sleep(0.02)
-        prov._handle_ptp_daemon_line(DAEMON_UP_LINE)
-
-    signaller = asyncio.create_task(_signal_soon())
-    try:
-        assert await prov.wait_ptp_daemon_ready(timeout=1.0) is True
-    finally:
-        await signaller
+    assert prov.ptp_daemon_running
+    assert prov.ptp_daemon_ready
+    assert await prov.wait_ptp_daemon_ready(timeout=1.5) is True
+    daemon.wait_ready.assert_awaited_once_with(1.5)
 
 
 # --- Session-wide PTP timing decision ------------------------------------------
