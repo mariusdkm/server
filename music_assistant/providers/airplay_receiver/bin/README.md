@@ -73,7 +73,7 @@ apk add --no-cache \
 # Clone and build
 git clone https://github.com/mikebrady/shairport-sync.git
 cd shairport-sync
-git checkout tags/4.3.7  # Use latest stable version
+git checkout tags/5.6.2  # Use latest stable version
 autoreconf -fi
 ./configure \
     --with-pipe \
@@ -99,7 +99,7 @@ brew install autoconf automake libtool pkg-config openssl libsodium libsoxr popt
 # Clone and build
 git clone https://github.com/mikebrady/shairport-sync.git
 cd shairport-sync
-git checkout tags/4.3.7
+git checkout tags/5.6.2
 autoreconf -fi
 ./configure \
     --with-pipe \
@@ -126,7 +126,7 @@ binary is always linked against the image's own libraries.
 
 ⚠️ **Important**: The macOS binary requires Homebrew libraries to be installed:
 ```bash
-brew install openssl libdaemon libconfig popt libao pulseaudio libsoxr
+brew install openssl libdaemon libconfig popt libao pulseaudio libsoxr ffmpeg
 ```
 
 For macOS development, it's easier to just install shairport-sync via Homebrew:

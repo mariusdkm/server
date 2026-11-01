@@ -51,6 +51,10 @@ build_linux() {
                 libssl-dev \
                 libdbus-1-dev \
                 libglib2.0-dev \
+                libavutil-dev \
+                libavcodec-dev \
+                libavformat-dev \
+                libswresample-dev \
                 ca-certificates
 
             # Fetch the pinned tag and verify it against the commit SHA from Dockerfile.base
@@ -116,6 +120,7 @@ build_macos() {
     brew list popt &> /dev/null || brew install popt
     brew list libconfig &> /dev/null || brew install libconfig
     brew list libdaemon &> /dev/null || brew install libdaemon
+    brew list ffmpeg &> /dev/null || brew install ffmpeg
 
     # Create temp directory
     TEMP_DIR=$(mktemp -d)
@@ -146,7 +151,7 @@ build_macos() {
         --without-dns-sd \
         --with-tinysvcmdns \
         --with-libdaemon \
-        PKG_CONFIG_PATH="$(brew --prefix openssl)/lib/pkgconfig:$(brew --prefix libconfig)/lib/pkgconfig" \
+        PKG_CONFIG_PATH="$(brew --prefix openssl)/lib/pkgconfig:$(brew --prefix libconfig)/lib/pkgconfig:$(brew --prefix ffmpeg)/lib/pkgconfig" \
         LDFLAGS="-L$(brew --prefix)/lib" \
         CFLAGS="-I$(brew --prefix)/include" \
         LIBS="-lm -lpthread -lssl -lcrypto -lconfig -lpopt"
