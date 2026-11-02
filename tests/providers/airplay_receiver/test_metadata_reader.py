@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import pathlib
@@ -12,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.providers.airplay_receiver.metadata import MetadataReader
 
 
@@ -133,3 +135,49 @@ async def test_reader_keeps_pipe_attached_across_restart(
         await _wait_for(lambda: updates[-1:] == [{"play_state": "stopped"}], timeout=5.0)
     finally:
         await reader.stop()
+
+
+def _item_xml(item_type: str, code: str, data: bytes) -> str:
+    """Return a metadata item as shairport-sync writes it to the pipe."""
+    return (
+        f"<item><type>{item_type.encode().hex()}</type><code>{code.encode().hex()}</code>"
+        f"<length>{len(data)}</length>\n"
+        f'<data encoding="base64">\n{base64.b64encode(data).decode()}</data></item>'
+    )
+
+
+@pytest.mark.parametrize(
+    ("code", "data", "logged"),
+    [
+        pytest.param("asar", b"Daft Punk", "data=Daft Punk", id="text"),
+        pytest.param(
+            "copl",
+            b"bplist00\xd4\x01\x02\x00\xff\xd8\n(PTP",
+            "<19 bytes of binary data>",
+            id="plist",
+        ),
+        pytest.param("abcd", b"\xff\xfe\n", "<3 bytes of binary data>", id="invalid_utf8"),
+    ],
+)
+async def test_binary_items_are_not_logged_as_text(
+    caplog: pytest.LogCaptureFixture, code: str, data: bytes, logged: str
+) -> None:
+    """Items that are not text are logged by size, not as text full of control characters."""
+    reader = MetadataReader("/nonexistent", logging.getLogger("test"), None)
+    caplog.set_level(VERBOSE_LOG_LEVEL)
+    reader._parse_xml_item(_item_xml("ssnc", code, data))
+    await asyncio.gather(*reader._background_tasks)
+    assert logged in caplog.text
+    assert "(PTP" not in caplog.text
+
+
+async def test_text_fields_survive_invalid_utf8() -> None:
+    """A stray byte in the artist, album or title doesn't drop the field."""
+    reader = MetadataReader("/nonexistent", logging.getLogger("test"), None)
+    reader._parse_xml_item(_item_xml("core", "asar", b"Daft Punk\xc3"))
+    reader._parse_xml_item(_item_xml("core", "asal", b"Discovery\x00"))
+    reader._parse_xml_item(_item_xml("core", "minm", b"\xffOne More Time"))
+    await asyncio.gather(*reader._background_tasks)
+    assert reader._current_metadata["artist"] == "Daft Punk"
+    assert reader._current_metadata["album"] == "Discovery\x00"
+    assert reader._current_metadata["title"] == "One More Time"
