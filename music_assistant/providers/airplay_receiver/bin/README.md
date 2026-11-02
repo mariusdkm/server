@@ -115,6 +115,16 @@ strip shairport-sync
 cp shairport-sync ../music_assistant/providers/airplay_receiver/bin/shairport-sync-macos-$(uname -m)
 ```
 
+## Patches
+
+The builds (`Dockerfile.base` and `build_binaries.sh`) apply `patches/*.patch` to the pinned
+release. Each one is a change submitted to shairport-sync, carried until a release includes it:
+
+- `0001-mdns-metadata-backend.patch`: a `metadata` mDNS backend, so the server can advertise
+  the AirPlay 2 receiver itself (mikebrady/shairport-sync#TODO).
+
+Remove a patch when bumping to a release that contains it.
+
 ## Docker Integration
 
 The Music Assistant base image (`Dockerfile.base`, `shairport-builder` stage) builds
@@ -126,7 +136,8 @@ binary is always linked against the image's own libraries.
 
 ⚠️ **Important**: The macOS binary requires Homebrew libraries to be installed:
 ```bash
-brew install openssl libdaemon libconfig popt libao pulseaudio libsoxr ffmpeg
+brew install openssl libdaemon libconfig popt libao pulseaudio libsoxr ffmpeg \
+    libplist libsodium libgcrypt
 ```
 
 For macOS development, it's easier to just install shairport-sync via Homebrew:

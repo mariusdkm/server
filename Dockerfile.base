@@ -134,6 +134,8 @@ RUN PYAV_VERSION=$(python -c "import json; reqs=json.load(open('/tmp/sendspin_ma
 # libraries, using the same configuration as music_assistant/providers/airplay_receiver/bin/build_binaries.sh:
 # tinysvcmdns as embedded mDNS backend (no avahi), stdout/pipe outputs and metadata support.
 # Linked against our own FFmpeg (5.x decodes with it), which the final image ships.
+# With AirPlay 2, timed by the AirPlay provider's PTP daemon and advertised by the server
+# through the "metadata" mDNS backend (patches/, until it is in a release).
 FROM python:${PYTHON_VERSION}-slim-trixie AS shairport-builder
 
 RUN sed -i 's/^Components: .*/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources
@@ -150,6 +152,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     libdbus-1-dev \
     libglib2.0-dev \
+    libplist-dev \
+    libplist-utils \
+    libsodium-dev \
+    libgcrypt20-dev \
+    uuid-dev \
+    xxd \
     ca-certificates \
     # runtime libraries of our FFmpeg, needed to link against it
     libfdk-aac2 libmp3lame0 libopus0 libvorbis0a libvorbisenc2 libsoxr0 libspeex1 \
@@ -170,6 +178,7 @@ ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
 # pinned SHA. Bump both when changing the version.
 ARG SHAIRPORT_VERSION=5.6.2
 ARG SHAIRPORT_SHA=0a34fbda83724cc06266aadcf7c88acc8fef4e7d
+COPY music_assistant/providers/airplay_receiver/bin/patches/ /tmp/shairport-patches/
 RUN set -x \
     && git init /tmp/shairport-sync \
     && cd /tmp/shairport-sync \
@@ -177,6 +186,7 @@ RUN set -x \
     && git fetch --depth 1 origin refs/tags/${SHAIRPORT_VERSION} \
     && git checkout FETCH_HEAD \
     && test "$(git rev-parse HEAD)" = "${SHAIRPORT_SHA}" \
+    && git apply /tmp/shairport-patches/*.patch \
     && autoreconf -fi \
     && ./configure \
         --with-pipe \
@@ -186,11 +196,12 @@ RUN set -x \
         --with-tinysvcmdns \
         --with-ssl=openssl \
         --with-stdout \
+        --with-airplay-2 \
         --sysconfdir=/etc \
     && make -j$(nproc) \
     && strip shairport-sync \
     && cp shairport-sync /usr/local/bin/shairport-sync \
-    && rm -rf /tmp/shairport-sync
+    && rm -rf /tmp/shairport-sync /tmp/shairport-patches
 
 ##################################################################################################
 
@@ -269,6 +280,7 @@ RUN set -x \
         # AirPlay receiver dependencies (shairport-sync)
         libconfig11 \
         libpopt0 \
+        libplist-2.0-4 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && rm -f \
@@ -338,7 +350,9 @@ COPY --from=shairport-builder /usr/local/bin/shairport-sync /usr/local/bin/
 COPY --from=pyav-builder /wheels/ /usr/local/share/pyav-wheels/
 
 # Verify FFmpeg and the custom PyAV wheel with all codec runtime libraries available.
-RUN ldconfig && ffmpeg -version && ffprobe -version && shairport-sync -V \
+RUN ldconfig && ffmpeg -version && ffprobe -version \
+    && shairport-sync -V | grep -q -- "-AirPlay2-smi11-" \
+    && shairport-sync -h | grep -qx "    metadata" \
     && python -m pip install --no-cache-dir --no-index --no-deps \
         --target /tmp/pyav-check /usr/local/share/pyav-wheels/av*.whl \
     && PYTHONPATH=/tmp/pyav-check python -c "import av; print(av.library_versions)" \
