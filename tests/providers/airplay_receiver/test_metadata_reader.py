@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from music_assistant.constants import VERBOSE_LOG_LEVEL
+from music_assistant.providers.airplay_receiver.mdns import ServiceRegistration
 from music_assistant.providers.airplay_receiver.metadata import MetadataReader
 
 
@@ -181,3 +182,27 @@ async def test_text_fields_survive_invalid_utf8() -> None:
     assert reader._current_metadata["artist"] == "Daft Punk"
     assert reader._current_metadata["album"] == "Discovery\x00"
     assert reader._current_metadata["title"] == "One More Time"
+
+
+async def test_service_registration_delivered(pipe_path: str) -> None:
+    """A service from the "metadata" mDNS backend is delivered for publishing."""
+    updates: list[dict[str, Any]] = []
+    reader = MetadataReader(pipe_path, logging.getLogger("test"), updates.append)
+    await reader.start()
+    try:
+        payload = b"service=_airplay._tcp\nname=Kitchen\nport=7123\ntxt=a=1\n"
+        await _write_marker(pipe_path, _item_xml("ssnc", "svrg", payload))
+        await _wait_for(lambda: bool(updates))
+        assert updates == [
+            {"mdns_service": ServiceRegistration("_airplay._tcp", "Kitchen", 7123, {"a": "1"})}
+        ]
+    finally:
+        await reader.stop()
+
+
+async def test_malformed_service_registration_ignored() -> None:
+    """A service that cannot be advertised is not passed on."""
+    updates: list[dict[str, Any]] = []
+    reader = MetadataReader("/nonexistent", logging.getLogger("test"), updates.append)
+    await reader._process_metadata_item("ssnc", "svrg", "name=Kitchen\n")
+    assert updates == []
