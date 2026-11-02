@@ -10,7 +10,7 @@ from contextlib import suppress
 from typing import TYPE_CHECKING, Final
 
 from music_assistant.constants import VERBOSE_LOG_LEVEL
-from music_assistant.helpers.process import AsyncProcess
+from music_assistant.helpers.process import AsyncProcess, check_output
 
 from .constants import CLI_PROBLEM_MARKERS, PTP_DAEMON_WARN_BURST, PTP_DAEMON_WARN_WINDOW
 from .helpers import CLI_CLOCK_OFFSET_NS, get_cli_binary
@@ -23,11 +23,15 @@ if TYPE_CHECKING:
 # is spawned but not yet able to serve shared-clock streams, so a group start
 # before it would race the daemon's readiness.
 PTP_DAEMON_READY_MARKER: Final[str] = "[PTP] daemon up"
+# Appended to the ready line when the daemon also stands in for nqptp.
+PTP_DAEMON_NQPTP_MARKER: Final[str] = "nqptp=on"
 # Bounded wait for the daemon to report readiness before a stream session
 # decides its timing source. Once ready the check returns immediately; only a
 # session that starts while the daemon is still coming up (or never binds) pays
 # any of this, and only up to the moment readiness is signalled.
 PTP_DAEMON_READY_TIMEOUT: Final[float] = 3.0
+# Exit code of a daemon whose nqptp control port (UDP 9000) is taken.
+PTP_DAEMON_EXIT_NQPTP: Final[int] = 3
 
 _DAEMONS: weakref.WeakKeyDictionary[MusicAssistant, PtpDaemon] = weakref.WeakKeyDictionary()
 
@@ -49,7 +53,7 @@ class PtpDaemon:
         """
         self.mass = mass
         self.logger = logging.getLogger(__name__)
-        self._owners: set[str] = set()
+        self._owners: dict[str, bool] = {}
         self._trace = False
         self._lock = asyncio.Lock()
         self._process: AsyncProcess | None = None
@@ -57,6 +61,10 @@ class PtpDaemon:
         self._started: float = 0.0
         self._restarted = False
         self._stop_requested = False
+        self._compat = False
+        self._compat_blocked = False
+        self._nqptp_active = False
+        self._supports_compat: bool | None = None
         # Set once the running daemon reports it has bound 319/320 and opened its
         # control channel; created/cleared per daemon start so a crash+restart
         # re-gates readiness. None until the daemon is first started.
@@ -98,22 +106,39 @@ class PtpDaemon:
         """Return whether the daemon has bound UDP 319/320 and is still alive."""
         return self.running and self._ready is not None and self._ready.is_set()
 
-    async def acquire(self, owner: str, logger: logging.Logger, *, trace: bool = False) -> None:
+    @property
+    def nqptp_active(self) -> bool:
+        """Return whether the ready daemon also serves shairport-sync (`--nqptp-compat`)."""
+        return self.ready and self._nqptp_active
+
+    async def acquire(
+        self,
+        owner: str,
+        logger: logging.Logger,
+        *,
+        nqptp_compat: bool = False,
+        trace: bool = False,
+    ) -> None:
         """
-        Hold the daemon, starting it if needed.
+        Hold the daemon, starting it (or restarting it with nqptp compatibility) if needed.
 
         :param owner: A unique name of the holder, released with :meth:`release`.
         :param logger: Logger for the daemon's output when this call starts it.
+        :param nqptp_compat: The holder needs the daemon to stand in for nqptp.
         :param trace: Run the daemon with its per-packet PTP trace.
         """
         async with self._lock:
-            self._owners.add(owner)
+            self._owners[owner] = nqptp_compat
             self._trace = self._trace or trace
-            if self.running:
+            want_compat = self._wants_compat() and await self._compat_supported()
+            if self.running and (self._compat or not want_compat):
                 return
+            if self.running:
+                self.logger.info("Restarting the PTP clock daemon to serve shairport-sync")
+                await self._stop()
             self.logger = logger
             self._restarted = False
-            await self._start()
+            await self._start(want_compat)
 
     async def release(self, owner: str) -> None:
         """
@@ -122,13 +147,11 @@ class PtpDaemon:
         :param owner: The name given to :meth:`acquire`.
         """
         async with self._lock:
-            if owner not in self._owners:
-                return
-            self._owners.discard(owner)
-            if self._owners:
+            if self._owners.pop(owner, None) is None or self._owners:
                 return
             await self._stop()
             self._trace = False
+            self._compat_blocked = False
 
     async def wait_ready(self, timeout: float = PTP_DAEMON_READY_TIMEOUT) -> bool:
         """
@@ -169,7 +192,23 @@ class PtpDaemon:
             exit_task.cancel()
             await asyncio.gather(ready_task, exit_task, return_exceptions=True)
 
-    async def _start(self) -> None:
+    def _wants_compat(self) -> bool:
+        """Return whether any holder needs nqptp compatibility (and it is not blocked)."""
+        return any(self._owners.values()) and not self._compat_blocked
+
+    async def _compat_supported(self) -> bool:
+        """Return whether the cliairplay binary knows `--nqptp-compat`."""
+        if self._supports_compat is None:
+            try:
+                _, output = await check_output(await get_cli_binary(), "--help", timeout=10)
+            except RuntimeError, OSError, TimeoutError:
+                return False
+            self._supports_compat = b"--nqptp-compat" in output
+            if not self._supports_compat:
+                self.logger.warning("This cliairplay cannot stand in for nqptp (no --nqptp-compat)")
+        return self._supports_compat
+
+    async def _start(self, nqptp_compat: bool) -> None:
         """Spawn the daemon (cliairplay --ptp-daemon)."""
         try:
             cli_binary = await get_cli_binary()
@@ -191,6 +230,8 @@ class PtpDaemon:
             "--clock-offset-ns",
             str(CLI_CLOCK_OFFSET_NS),
         ]
+        if nqptp_compat:
+            args.append("--nqptp-compat")
         if_arg = await self.mass.streams.get_source_ip()
         if if_arg:
             args += ["--if", if_arg]
@@ -203,7 +244,11 @@ class PtpDaemon:
         # The binding the daemon ends up with is the first thing needed when triaging
         # timing issues from a user's log, and it is invisible otherwise: --if is left
         # out entirely for a default bind ip.
-        self.logger.debug("Starting shared PTP clock daemon: if=%s", if_arg or "<all interfaces>")
+        self.logger.debug(
+            "Starting shared PTP clock daemon: if=%s nqptp=%s",
+            if_arg or "<all interfaces>",
+            "on" if nqptp_compat else "off",
+        )
         daemon = AsyncProcess(args, stdout=True, stderr=True, name="cliairplay-ptp-daemon")
         # (Re)gate readiness for this daemon instance: not ready until a reader
         # sees the "daemon up" line (a restart clears any previous readiness).
@@ -211,6 +256,8 @@ class PtpDaemon:
             self._ready = asyncio.Event()
         else:
             self._ready.clear()
+        self._nqptp_active = False
+        self._compat = nqptp_compat
         self._stop_requested = False
         self._reset_warn_budget()
         await daemon.start()
@@ -266,6 +313,7 @@ class PtpDaemon:
             and not event.is_set()
             and PTP_DAEMON_READY_MARKER in line
         ):
+            self._nqptp_active = PTP_DAEMON_NQPTP_MARKER in line
             self.logger.debug("Shared PTP clock daemon reported ready")
             event.set()
 
@@ -337,6 +385,16 @@ class PtpDaemon:
         # clock (a restart re-sets it once the new daemon reports ready).
         if self._ready is not None:
             self._ready.clear()
+        if self._compat and returncode == PTP_DAEMON_EXIT_NQPTP:
+            # A real nqptp holds UDP 9000: keep PTP for the sender, and let the
+            # receiver fall back to classic AirPlay.
+            self._compat_blocked = True
+            self.logger.warning(
+                "UDP port 9000 is taken (is nqptp running on this host?) - "
+                "AirPlay 2 receiving is unavailable"
+            )
+            await self._start(False)
+            return
         runtime = time.monotonic() - self._started
         if runtime < 5:
             # immediate exit: UDP 319/320 already taken or missing privileges
@@ -355,7 +413,7 @@ class PtpDaemon:
             self.logger.warning(
                 "PTP clock daemon stopped unexpectedly (exit code %s) - restarting", returncode
             )
-            await self._start()
+            await self._start(self._compat)
             return
         self.logger.warning(
             "PTP clock daemon stopped again (exit code %s) - giving up. "
