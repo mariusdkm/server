@@ -57,7 +57,7 @@ class _FakePushStream:
     def prepare_audio(self, *_args: object, **_kwargs: object) -> None:
         pass
 
-    async def commit_audio(self) -> int:
+    async def commit_audio(self, *, play_start_us: int | None = None) -> int:
         timestamp = next(self._commit_timestamps)
         self._now_us = next(self._now_timestamps)
         return timestamp
