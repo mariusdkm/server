@@ -58,7 +58,7 @@ class _FakePushStream:
     def prepare_audio(self, *_args: object, **_kwargs: object) -> None:
         pass
 
-    async def commit_audio(self) -> int:
+    async def commit_audio(self, *, play_start_us: int | None = None) -> int:
         timestamp = next(self._commit_timestamps)
         self._now_us = next(self._now_timestamps)
         return timestamp
@@ -392,7 +392,7 @@ async def test_a_commit_finishing_after_its_stream_was_replaced_leaves_the_sessi
     class _ReplacedMidCommit(_FakePushStream):
         calls = 0
 
-        async def commit_audio(self) -> int:
+        async def commit_audio(self, *, play_start_us: int | None = None) -> int:
             self.calls += 1
             if self.calls == 2:
                 # The next playback starts a new stream and resets the session state.
@@ -403,7 +403,7 @@ async def test_a_commit_finishing_after_its_stream_was_replaced_leaves_the_sessi
                 session._produced_audio_us = 0
                 session._timeline_start_us = None
                 return first_us + 30_000_000
-            return await super().commit_audio()
+            return await super().commit_audio(play_start_us=play_start_us)
 
     player = MagicMock()
     player.player_id = "leader"
