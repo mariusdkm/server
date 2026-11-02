@@ -232,9 +232,18 @@ class MetadataReader:
                         if code_str in ("PICT", "astm"):
                             # Cover art and duration: keep as raw bytes
                             data = decoded_data
-                        else:
-                            # Text metadata: decode to UTF-8
+                        elif code_str in ("asar", "asal", "minm"):
+                            # Artist, album, title: decode leniently, a stray byte
+                            # shouldn't cost the whole field
                             data = decoded_data.decode("utf-8", errors="ignore")
+                        else:
+                            # Other items that aren't text (like the 'copl' plist iOS sends,
+                            # with the artwork in it) stay bytes, so they're never logged as text
+                            try:
+                                text = decoded_data.decode("utf-8")
+                            except UnicodeDecodeError:
+                                text = None
+                            data = decoded_data if text is None or "\x00" in text else text
                     except Exception as err:
                         self.logger.debug("Error decoding base64 data: %s", err)
 
@@ -263,12 +272,13 @@ class MetadataReader:
         :param data: Optional metadata data (string, bytes, or None).
         """
         # Don't log binary data (like cover art)
-        if code == "PICT":
+        if isinstance(data, bytes):
             self.logger.log(
                 VERBOSE_LOG_LEVEL,
-                "Metadata: type=%s, code=%s, data=<binary image data>",
+                "Metadata: type=%s, code=%s, data=<%d bytes of binary data>",
                 item_type,
                 code,
+                len(data),
             )
         else:
             self.logger.log(
