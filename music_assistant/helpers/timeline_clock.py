@@ -102,12 +102,22 @@ class TimelineClock:
 
     def now_ns(self) -> int:
         """Return the current time on the timeline, in ns."""
-        raw_ns = raw_clock_ns()
-        return raw_ns + rate_term_ns(raw_ns, self._rate_ppb) + self._offset_ns
+        return self.from_raw_ns(raw_clock_ns())
 
     def now_us(self) -> int:
         """Return the current time on the timeline, in µs."""
         return self.now_ns() // 1000
+
+    def from_raw_ns(self, raw_ns: int) -> int:
+        """
+        Return the time on the timeline of a reading of the raw clock.
+
+        For a time stamped on the raw clock of this host by another process, like the play
+        times of shairport-sync's blockaudio output.
+
+        :param raw_ns: The reading of the raw clock, in ns.
+        """
+        return raw_ns + rate_term_ns(raw_ns, self._rate_ppb) + self._offset_ns
 
     def set_rate(self, rate_ppb: int) -> None:
         """

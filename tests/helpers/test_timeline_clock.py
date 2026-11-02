@@ -141,6 +141,20 @@ def test_clock_offset_carries_the_timeline_across_a_rate_change() -> None:
     assert clock.offset_ns == -rate_term_ns(3 * HOUR_NS, 857_000)
 
 
+def test_a_raw_time_stamp_lands_where_the_timeline_reads_it() -> None:
+    """A time another process stamped on the raw clock maps to the timeline as now_ns() would."""
+    clock = TimelineClock()
+    with _raw_at(3 * HOUR_NS):
+        clock.set_rate(-18_257)
+    # e.g. a play time 1.5 s ahead of now, stamped by shairport-sync
+    raw_ns = 7 * HOUR_NS + 1_500_000_042
+    with _raw_at(raw_ns):
+        assert clock.from_raw_ns(raw_ns) == clock.now_ns()
+    assert clock.from_raw_ns(raw_ns) - clock.from_raw_ns(raw_ns - 1000 * NS) == (
+        1000 * NS - 1000 * 18_257
+    )
+
+
 def test_rate_listeners_follow_a_rate_change() -> None:
     """A listener runs once the new rate is in place, until it is removed."""
     clock = TimelineClock()

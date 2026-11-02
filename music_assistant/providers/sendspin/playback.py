@@ -29,7 +29,7 @@ from music_assistant.controllers.streams.audio_processing import get_media_sessi
 from music_assistant.helpers.audio import arriving_audio_format, iter_pcm_slices, resample_pcm_audio
 from music_assistant.helpers.ffmpeg import FFMpeg
 from music_assistant.helpers.util import import_module_in_thread
-from music_assistant.models.media_capabilities import AudioSourceRefusedError
+from music_assistant.models.media_capabilities import AudioSourceMixin, AudioSourceRefusedError
 from music_assistant.models.music_provider import ProviderStreamLimitError
 from music_assistant.models.player import PlayerMedia
 from music_assistant.providers.sendspin.bridge_role import (
@@ -38,6 +38,7 @@ from music_assistant.providers.sendspin.bridge_role import (
     BRIDGE_SAMPLE_RATE,
     BridgePlayerRole,
 )
+from music_assistant.providers.sendspin.live_timeline import DriftResampler, LiveTimeline
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Iterable
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
     from music_assistant.controllers.streams.audio_processing import AudioOutputPlan
     from music_assistant.controllers.streams.controller import AudioSourceStream
     from music_assistant.helpers.dsp import ComplexFilter
+    from music_assistant.helpers.live_timing import LiveTiming
 
     from .player import SendspinPlayer
     from .provider import SendspinProvider
@@ -111,6 +113,10 @@ _JOIN_PROMOTE_TOLERANCE_US = 50_000
 _JOIN_PROMOTION_TIMEOUT_S = 15.0
 # Anchor movement that publishes elapsed time and refreshes beats right away.
 ANCHOR_REBASE_SIGNIFICANT_US = 500_000
+_LIVE_TIMING_LOG_INTERVAL_US = 60_000_000
+# A live source may only know whether it has play times once its first audio arrives, after
+# the server already sent some silence; until then, keep checking.
+_LIVE_TIMING_RESOLVE_US = 2_000_000
 # Retain committed history this far behind real-time for late-join backfill.
 # This pre-history also warms up ffmpeg's internal filter buffers so the DSP
 # output has settled by the time the member's channel goes live.
@@ -245,6 +251,8 @@ class _PendingChunk:
     duration_us: int
     # the later item whose first chunk this is
     starts_item: PlayerMedia | None = None
+    # frames of the item's stream before this chunk
+    position: int = 0
 
 
 @dataclass(slots=True)
@@ -969,6 +977,12 @@ class SendspinPlaybackSession:
         last_elapsed_update_s: float | None = None
         reported_anchor_us: int | None = None
         reported_upcoming: tuple[PlayerMedia | None, float | None] = (None, None)
+        live_timing: LiveTiming | None = None
+        live_timeline = LiveTimeline(self._pcm_format.sample_rate)
+        drift_resampler = DriftResampler(self._pcm_format.sample_rate, self._pcm_format.channels)
+        last_timeline_log_us = 0
+        # a flush only needs the clients cleared when audio went out since the last clear
+        committed_since_clear = False
 
         async def _produce_pending_chunks() -> None:
             item_media: PlayerMedia | None = media
@@ -1052,11 +1066,13 @@ class SendspinPlaybackSession:
                     return
                 await asyncio.sleep((remaining_us - lead_us) / 1_000_000)
 
-        async def _produce_item_chunks(item_media: PlayerMedia) -> None:
+        async def _produce_item_chunks(item_media: PlayerMedia) -> None:  # noqa: PLR0915
             nonlocal pending_duration_us, produced_us
             starts_item = item_media if self._item_starts else None
             self._item_starts.append((produced_us, item_media))
             audio_source: AsyncGenerator[bytes] | None = None
+            frame_size = self._pcm_format.channels * self._pcm_format.bit_depth // 8
+            position = 0
             completed = False
             try:
                 await self._load_item_streamdetails(item_media)
@@ -1085,8 +1101,12 @@ class SendspinPlaybackSession:
                             continue
                         await self._refresh_member_mappings()
                         pending = _PendingChunk(
-                            pcm=slice_chunk, duration_us=duration_us, starts_item=starts_item
+                            pcm=slice_chunk,
+                            duration_us=duration_us,
+                            starts_item=starts_item,
+                            position=position,
                         )
+                        position += len(slice_chunk) // frame_size
                         starts_item = self._opening_item = None
                         await pending_chunks.put(pending)
                         pending_backlog.append(pending)
@@ -1322,131 +1342,264 @@ class SendspinPlaybackSession:
             if len(chunks) == 1:
                 return first, source_ended
             pcm = b"".join(chunk.pcm for chunk in chunks)
-            return _PendingChunk(pcm, self._duration_us(pcm, self._pcm_format)), source_ended
+            joined = _PendingChunk(
+                pcm, self._duration_us(pcm, self._pcm_format), position=first.position
+            )
+            return joined, source_ended
+
+        commit_count = 0
+        previous_timeline_start_us: int | None = None
+        # Clock times of the commit loop, for the debug line about a moved timeline.
+        first_lead_us = 0
+        previous_commit_called_us = 0
+
+        async def _commit(
+            pcm: bytes,
+            member_chunks: list[tuple[UUID, bytes]],
+            duration_us: int,
+            waiting_since_us: int,
+            play_start_us: int | None = None,
+        ) -> int | None:
+            """Commit a chunk and return where it starts, or None once the stream stopped."""
+            nonlocal commit_count, previous_timeline_start_us, first_lead_us
+            nonlocal previous_commit_called_us
+            push_stream.prepare_audio(pcm, self._sendspin_pcm_format, channel_id=MAIN_CHANNEL)
+            for channel_id, member_pcm in member_chunks:
+                push_stream.prepare_audio(
+                    member_pcm, self._sendspin_pcm_format, channel_id=channel_id
+                )
+            commit_called_us = push_stream.now_us()
+            try:
+                commit_start_us = await (
+                    push_stream.commit_audio()
+                    if play_start_us is None
+                    else push_stream.commit_audio(play_start_us=play_start_us)
+                )
+            except StreamStoppedError:
+                # Stream stopped since it was replaced by another stream
+                self.player.logger.debug("Stopping commit loop due to stopped push stream")
+                return None
+            await push_stream.sleep_to_limit_buffer(_PRODUCER_BUFFER_LIMIT_US)
+            commit_now_us = push_stream.now_us()
+            committed_history_chunk = _HistoryChunk(
+                start_time_us=int(commit_start_us),
+                duration_us=duration_us,
+                pcm=pcm,
+                # aiosendspin moves the schedule forward when the producer falls behind.
+                timeline_start_us=int(commit_start_us) - self._produced_audio_us,
+                pcm_format=self._pcm_format,
+            )
+            async with self._state_lock:
+                # A commit in flight when the next playback replaced this stream still
+                # returns, stamped from the old stream's buffer (up to 30 s ahead). The
+                # session state belongs to the new stream by then: leave it alone.
+                if push_stream.is_stopped or self._push_stream is not push_stream:
+                    self.player.logger.debug("Stopping commit loop: the push stream was replaced")
+                    return None
+                self._history.append(committed_history_chunk)
+                anchor_us = self._playing_timeline_start_us_locked(commit_now_us)
+                self._timeline_start_us = anchor_us
+                self._produced_audio_us += duration_us
+                self._prune_history_locked(commit_now_us)
+            commit_count += 1
+            timeline_start_us = committed_history_chunk.timeline_start_us
+            lead_us = int(commit_start_us) - commit_called_us
+            if commit_count == 1:
+                first_lead_us = lead_us
+            elif (
+                commit_count <= _START_LOG_COMMITS
+                and previous_timeline_start_us is not None
+                # anything smaller is rounding
+                and abs(timeline_start_us - previous_timeline_start_us) >= 1_000
+            ):
+                self.player.logger.debug(
+                    "Play timeline moved %+.1f ms at commit %d of the stream: the commit "
+                    "before it and what follows it took %.1f ms, then getting the audio "
+                    "of this one ready %.1f ms; scheduled %.1f ms ahead, the first commit "
+                    "%.1f ms",
+                    (timeline_start_us - previous_timeline_start_us) / 1000,
+                    commit_count,
+                    (waiting_since_us - previous_commit_called_us) / 1000,
+                    (commit_called_us - waiting_since_us) / 1000,
+                    lead_us / 1000,
+                    first_lead_us / 1000,
+                )
+            previous_timeline_start_us = timeline_start_us
+            previous_commit_called_us = commit_called_us
+            await _report_timeline(anchor_us, commit_now_us)
+            await self._fanout_history_chunk_to_join_processors(committed_history_chunk)
+            return int(commit_start_us)
+
+        async def _commit_timed(
+            timing: LiveTiming,
+            pending: _PendingChunk,
+            member_chunks: list[tuple[UUID, bytes]],
+            waiting_since_us: int,
+        ) -> bool:
+            """Commit a chunk where the source wants it played, if it can still play in time."""
+            nonlocal committed_since_clear, last_timeline_log_us
+            sample_rate = self._pcm_format.sample_rate
+            frame_size = self._pcm_format.channels * self._pcm_format.bit_depth // 8
+            frames = len(pending.pcm) // frame_size
+            found = timing.play_time(pending.position, frames, sample_rate)
+            timing.prune(pending.position + frames, sample_rate)
+            now_us = push_stream.now_us()
+            if now_us - last_timeline_log_us >= _LIVE_TIMING_LOG_INTERVAL_US:
+                self.player.logger.debug("Live source timeline: %s", live_timeline.summary())
+                last_timeline_log_us = now_us
+            if found is None:
+                # inserted silence, or audio the source flushed
+                return True
+            offset, play_ns = found
+            # the source times its audio on the raw clock of the host, Sendspin on the
+            # server's timeline, which runs at the rate the server corrects it to
+            play_us = self.player.mass.timeline_clock.from_raw_ns(play_ns) / 1000
+            placement = live_timeline.place(play_us, frames - offset, now_us)
+            if placement is None:
+                return True
+            offset += placement.skip_frames
+            if offset == frames:
+                return True
+            if placement.play_start_us is not None:
+                drift_resampler.reset()
+            start = offset * frame_size
+            (_, pcm), *resampled_members = drift_resampler.process(
+                placement.adjust,
+                [
+                    (MAIN_CHANNEL, pending.pcm[start:]),
+                    *((channel_id, chunk[start:]) for channel_id, chunk in member_chunks),
+                ],
+            )
+            frames_out = len(pcm) // frame_size
+            if not frames_out:
+                # a new anchor's first frames are all still inside the resampler
+                return True
+            # set before the commit, so a flush while it is in flight still clears it
+            committed_since_clear = True
+            commit_start_us = await _commit(
+                pcm,
+                resampled_members,
+                frames_out * 1_000_000 // sample_rate,
+                waiting_since_us,
+                placement.play_start_us,
+            )
+            if commit_start_us is None:
+                return False
+            live_timeline.committed(placement, commit_start_us, frames - offset, frames_out)
+            return True
+
+        async def _clear_on_new_epoch(timing: LiveTiming) -> None:
+            """Drop audio the source flushed right away, not only once new audio arrives."""
+            nonlocal committed_since_clear
+            epoch = timing.epoch
+            while True:
+                epoch = await timing.wait_for_new_epoch(epoch)
+                if not committed_since_clear:
+                    continue
+                committed_since_clear = False
+                async with self._state_lock:
+                    # like a commit, a flush must not touch a replacing stream's state
+                    if push_stream.is_stopped or self._push_stream is not push_stream:
+                        return
+                    # aiosendspin's clear() forgets its timeline, so the next commit anchors anew
+                    live_timeline.reset()
+                    push_stream.clear()
+                    self._history.clear()
+
+        resolve_live_timing = self._may_have_live_timing(media)
 
         async def _commit_pending_chunks() -> None:  # noqa: PLR0915
-            nonlocal pending_duration_us
-            commit_count = 0
-            previous_timeline_start_us: int | None = None
-            # Clock times of the commit loop, for the debug line about a moved timeline.
-            first_lead_us = 0
-            previous_commit_called_us = 0
+            nonlocal pending_duration_us, live_timing, last_timeline_log_us
+            clear_task: asyncio.Task[None] | None = None
             await start_queued.wait()
             source_ended = False
-            while not source_ended:
-                waiting_since_us = push_stream.now_us()
-                pending = await pending_chunks.get()
-                if pending is None:
-                    break
-                pending_backlog.popleft()
-                pending_duration_us = max(0, pending_duration_us - pending.duration_us)
-                # a member that joined before the start gets its audio in the commits after
-                # the first, so those are left to come
-                if commit_count == 0 and not self._join_catchup:
-                    pending, source_ended = _take_start_queue(pending)
-                await self._inject_ready_join_historical(push_stream, pending_backlog, pending.pcm)
-                if pending.starts_item is not None:
-                    client_ids = [client.client_id for client in self.player.api.group.clients]
-                    if streamdetails := self._get_item_streamdetails(pending.starts_item):
-                        # each player's new format starts where the audio it was sent ends
-                        self._item_streamdetails = streamdetails
-                        await self._follow_session_sample_rate(client_ids, later_item=True)
-                    for client_id in client_ids:
-                        self._get_output_plan(client_id, pending.starts_item.queue_item_id)
-                push_stream.prepare_audio(
-                    pending.pcm, self._sendspin_pcm_format, channel_id=MAIN_CHANNEL
-                )
-                join_pending_ids, pipelines = await self._snapshot_active_pipelines()
-                transform_pipelines: list[_MemberPipeline] = []
-                for member_id, pipeline in pipelines:
-                    if not pipeline.config.requires_transform:
-                        continue
-                    if member_id in join_pending_ids:
-                        continue
-                    transform_pipelines.append(pipeline)
-                transformed_chunks = await asyncio.gather(
-                    *(
-                        self._read_member_chunk(pipeline, pending.duration_us)
-                        for pipeline in transform_pipelines
-                    ),
-                    return_exceptions=True,
-                )
-                for pipeline, transformed_chunk in zip(
-                    transform_pipelines, transformed_chunks, strict=True
-                ):
-                    if isinstance(transformed_chunk, BaseException):
-                        self.player.logger.warning(
-                            "Transform read failed for channel %s: %s",
-                            pipeline.channel_id,
-                            transformed_chunk,
-                        )
-                        continue
-                    if transformed_chunk is None:
-                        continue
-                    push_stream.prepare_audio(
-                        transformed_chunk,
-                        self._sendspin_pcm_format,
-                        channel_id=pipeline.channel_id,
-                    )
-                commit_called_us = push_stream.now_us()
-                try:
-                    commit_start_us = await push_stream.commit_audio()
-                except StreamStoppedError:
-                    # Stream stopped since it was replaced by another stream
-                    self.player.logger.debug("Stopping commit loop due to stopped push stream")
-                    break
-                await push_stream.sleep_to_limit_buffer(_PRODUCER_BUFFER_LIMIT_US)
-                commit_now_us = push_stream.now_us()
-                committed_history_chunk = _HistoryChunk(
-                    start_time_us=int(commit_start_us),
-                    duration_us=pending.duration_us,
-                    pcm=pending.pcm,
-                    # aiosendspin moves the schedule forward when the producer falls behind.
-                    timeline_start_us=int(commit_start_us) - self._produced_audio_us,
-                    pcm_format=self._pcm_format,
-                )
-                async with self._state_lock:
-                    # A commit in flight when the next playback replaced this stream still
-                    # returns, stamped from the old stream's buffer (up to 30 s ahead). The
-                    # session state belongs to the new stream by then: leave it alone.
-                    if push_stream.is_stopped or self._push_stream is not push_stream:
-                        self.player.logger.debug(
-                            "Stopping commit loop: the push stream was replaced"
-                        )
+            try:
+                while not source_ended:
+                    waiting_since_us = push_stream.now_us()
+                    pending = await pending_chunks.get()
+                    if pending is None:
                         break
-                    self._history.append(committed_history_chunk)
-                    anchor_us = self._playing_timeline_start_us_locked(commit_now_us)
-                    self._timeline_start_us = anchor_us
-                    self._produced_audio_us += pending.duration_us
-                    self._prune_history_locked(commit_now_us)
-                commit_count += 1
-                timeline_start_us = committed_history_chunk.timeline_start_us
-                lead_us = int(commit_start_us) - commit_called_us
-                if commit_count == 1:
-                    first_lead_us = lead_us
-                elif (
-                    commit_count <= _START_LOG_COMMITS
-                    and previous_timeline_start_us is not None
-                    # anything smaller is rounding
-                    and abs(timeline_start_us - previous_timeline_start_us) >= 1_000
-                ):
-                    self.player.logger.debug(
-                        "Play timeline moved %+.1f ms at commit %d of the stream: the commit "
-                        "before it and what follows it took %.1f ms, then getting the audio "
-                        "of this one ready %.1f ms; scheduled %.1f ms ahead, the first commit "
-                        "%.1f ms",
-                        (timeline_start_us - previous_timeline_start_us) / 1000,
-                        commit_count,
-                        (waiting_since_us - previous_commit_called_us) / 1000,
-                        (commit_called_us - waiting_since_us) / 1000,
-                        lead_us / 1000,
-                        first_lead_us / 1000,
+                    pending_backlog.popleft()
+                    pending_duration_us = max(0, pending_duration_us - pending.duration_us)
+                    if (
+                        resolve_live_timing
+                        and live_timing is None
+                        and self._produced_audio_us < _LIVE_TIMING_RESOLVE_US
+                    ):
+                        live_timing = self._get_live_timing(media)
+                        if live_timing is not None:
+                            self.player.logger.debug("Playing at the live source's play times")
+                            last_timeline_log_us = push_stream.now_us()
+                            if self._produced_audio_us:
+                                # what went out so far is the server's silence, scheduled on
+                                # Sendspin's own timeline, which the source's play times may
+                                # overlap
+                                push_stream.clear()
+                                async with self._state_lock:
+                                    self._history.clear()
+                            clear_task = asyncio.create_task(_clear_on_new_epoch(live_timing))
+                    # a member that joined before the start gets its audio in the commits after
+                    # the first, so those are left to come. Audio that may be timed is placed
+                    # chunk by chunk: a joined chunk could span a flush, or inserted silence.
+                    if commit_count == 0 and not self._join_catchup and not resolve_live_timing:
+                        pending, source_ended = _take_start_queue(pending)
+                    await self._inject_ready_join_historical(
+                        push_stream, pending_backlog, pending.pcm
                     )
-                previous_timeline_start_us = timeline_start_us
-                previous_commit_called_us = commit_called_us
-                await _report_timeline(anchor_us, commit_now_us)
-                await self._fanout_history_chunk_to_join_processors(committed_history_chunk)
-                pending_chunks.task_done()
+                    if pending.starts_item is not None:
+                        client_ids = [client.client_id for client in self.player.api.group.clients]
+                        if streamdetails := self._get_item_streamdetails(pending.starts_item):
+                            # each player's new format starts where the audio it was sent ends
+                            self._item_streamdetails = streamdetails
+                            await self._follow_session_sample_rate(client_ids, later_item=True)
+                        for client_id in client_ids:
+                            self._get_output_plan(client_id, pending.starts_item.queue_item_id)
+                    join_pending_ids, pipelines = await self._snapshot_active_pipelines()
+                    transform_pipelines: list[_MemberPipeline] = []
+                    for member_id, pipeline in pipelines:
+                        if not pipeline.config.requires_transform:
+                            continue
+                        if member_id in join_pending_ids:
+                            continue
+                        transform_pipelines.append(pipeline)
+                    # read even for audio that is dropped, so member pipelines stay aligned
+                    transformed_chunks = await asyncio.gather(
+                        *(
+                            self._read_member_chunk(pipeline, pending.duration_us)
+                            for pipeline in transform_pipelines
+                        ),
+                        return_exceptions=True,
+                    )
+                    member_chunks: list[tuple[UUID, bytes]] = []
+                    for pipeline, transformed_chunk in zip(
+                        transform_pipelines, transformed_chunks, strict=True
+                    ):
+                        if isinstance(transformed_chunk, BaseException):
+                            self.player.logger.warning(
+                                "Transform read failed for channel %s: %s",
+                                pipeline.channel_id,
+                                transformed_chunk,
+                            )
+                            continue
+                        if transformed_chunk is None:
+                            continue
+                        member_chunks.append((pipeline.channel_id, transformed_chunk))
+                    if live_timing is not None:
+                        if not await _commit_timed(
+                            live_timing, pending, member_chunks, waiting_since_us
+                        ):
+                            break
+                    elif (
+                        await _commit(
+                            pending.pcm, member_chunks, pending.duration_us, waiting_since_us
+                        )
+                        is None
+                    ):
+                        break
+                    pending_chunks.task_done()
+            finally:
+                if clear_task is not None:
+                    clear_task.cancel()
 
         commit_task = asyncio.create_task(_commit_pending_chunks())
         self._attach_task_exception_logger(commit_task, "commit_pending_chunks")
@@ -2317,6 +2470,27 @@ class SendspinPlaybackSession:
     def _is_member(self, player_id: str) -> bool:
         """Return whether a player is a member of this session or joining it."""
         return player_id in self._members or player_id in self.pending_join_members
+
+    def _may_have_live_timing(self, media: PlayerMedia) -> bool:
+        """Return whether the session plays a live AudioSource, the only kind with play times."""
+        # an AudioSource is never queued: it plays as media of its own type
+        return media.media_type == MediaType.AUDIO_SOURCE
+
+    def _get_live_timing(self, media: PlayerMedia) -> LiveTiming | None:
+        """Return the play times of a live source that provides its own."""
+        streamdetails = self._item_streamdetails
+        if (
+            streamdetails is None
+            and media.source_id
+            and (session := self.player.mass.players.get_audio_source_session(media.source_id))
+        ):
+            streamdetails = session.streamdetails
+        if streamdetails is None:
+            return None
+        provider = self.player.mass.get_provider(streamdetails.provider)
+        if not isinstance(provider, AudioSourceMixin):
+            return None
+        return provider.get_audio_source_timing(streamdetails)
 
     def _is_live_source(self, media: PlayerMedia) -> bool:
         """

@@ -22,7 +22,7 @@ def _recording_push_stream(session: object, calls: list[str]) -> MagicMock:
     push_stream = cast("MagicMock", cast("MagicMock", session)._create_push_stream.return_value)
     commit_timestamps = push_stream.commit_audio.side_effect
 
-    async def commit_audio() -> int:
+    async def commit_audio(**_kwargs: object) -> int:
         calls.append("commit")
         timestamp: int = next(commit_timestamps)
         return timestamp
