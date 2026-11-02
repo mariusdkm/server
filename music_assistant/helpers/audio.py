@@ -35,6 +35,8 @@ from .ffmpeg import DEFAULT_MP3_BIT_RATE, get_ffmpeg_stream
 from .process import AsyncProcess, communicate
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from music_assistant_models.streamdetails import StreamDetails
 
     from music_assistant.mass import MusicAssistant
@@ -425,6 +427,7 @@ async def audio_source_silence_keepalive(
     pcm_format: AudioFormat,
     silence_chunk_ms: int = 100,
     idle_threshold_s: float | None = None,
+    on_silence: Callable[[int, int], None] | None = None,
 ) -> AsyncGenerator[bytes]:
     """
     Wrap a live AudioSource PCM stream and emit silence during idle gaps.
@@ -447,6 +450,8 @@ async def audio_source_silence_keepalive(
     :param idle_threshold_s: Seconds without input before silence is inserted.
         Defaults to the chunk duration so silence flows at realtime — critical
         for keeping HTTP consumers (Sonos, Chromecast) connected.
+    :param on_silence: Called before each silence chunk is emitted, with the number of
+        frames of the inner stream relayed so far and the number of silent frames.
     """
     if idle_threshold_s is None:
         idle_threshold_s = silence_chunk_ms / 1000
@@ -485,17 +490,24 @@ async def audio_source_silence_keepalive(
             await queue.put(None)
 
     producer_task = asyncio.create_task(_producer())
+    relayed_bytes = 0
+    if on_silence is not None:
+        # a provider's bookkeeping must not end the stream for every player
+        on_silence = _log_errors_once(on_silence, "Error handling inserted silence")
     try:
         while True:
             try:
                 item = await asyncio.wait_for(queue.get(), timeout=idle_threshold_s)
             except TimeoutError:
+                if on_silence is not None:
+                    on_silence(relayed_bytes // frame_size, silence_bytes // frame_size)
                 yield silence_chunk
                 continue
             if item is None:
                 break
             if isinstance(item, Exception):
                 raise item
+            relayed_bytes += len(item)
             yield item
     finally:
         producer_task.cancel()
@@ -972,3 +984,21 @@ def get_normalization_mode(
 
     # simply return the preference
     return preference
+
+
+def _log_errors_once(
+    callback: Callable[[int, int], None], message: str
+) -> Callable[[int, int], None]:
+    """Wrap a callback that runs repeatedly so its errors are logged once, not raised."""
+    failed = False
+
+    def _call(*args: int) -> None:
+        nonlocal failed
+        try:
+            callback(*args)
+        except Exception:
+            if not failed:
+                LOGGER.warning(message, exc_info=True)
+            failed = True
+
+    return _call
