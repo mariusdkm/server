@@ -122,6 +122,9 @@ release. Each one is a change submitted to shairport-sync, carried until a relea
 
 - `0001-mdns-metadata-backend.patch`: a `metadata` mDNS backend, so the server can advertise
   the AirPlay 2 receiver itself (mikebrady/shairport-sync#TODO).
+- `0002-pipe-timing-headers.patch`: timing headers on the pipe output, so the server knows
+  when the sender wants each frame played, plus a fix so the time is right when the player
+  skips the start of a late packet (both in mikebrady/shairport-sync#TODO).
 
 Remove a patch when bumping to a release that contains it.
 
