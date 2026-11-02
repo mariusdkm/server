@@ -749,6 +749,66 @@ class TestAudioSourceSilenceKeepalive:
         assert silence_chunk in out
 
     @pytest.mark.asyncio
+    async def test_reports_inserted_silence(self) -> None:
+        """Each silence chunk is reported with the inner frames relayed before it."""
+        from music_assistant.helpers.audio import (  # noqa: PLC0415
+            audio_source_silence_keepalive,
+        )
+
+        async def _inner() -> AsyncGenerator[bytes]:
+            yield b"\x01" * 40
+            await asyncio.sleep(0.12)
+            yield b"\x01" * 8
+
+        reports: list[tuple[int, int]] = []
+        out = [
+            chunk
+            async for chunk in audio_source_silence_keepalive(
+                _inner(),
+                _audio_format(),
+                idle_threshold_s=0.05,
+                silence_chunk_ms=10,
+                on_silence=lambda position, frames: reports.append((position, frames)),
+            )
+        ]
+        assert reports
+        # 10 ms at 44.1 kHz, inserted after the first 10 frames
+        assert all(report == (10, 441) for report in reports)
+        assert len(out) == len(reports) + 2
+
+    @pytest.mark.asyncio
+    async def test_failing_silence_handler_keeps_the_stream(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An error in the silence handler is logged once and the stream carries on."""
+        from music_assistant.helpers.audio import (  # noqa: PLC0415
+            audio_source_silence_keepalive,
+        )
+
+        async def _inner() -> AsyncGenerator[bytes]:
+            yield b"\x01" * 40
+            await asyncio.sleep(0.12)
+            yield b"\x02" * 8
+
+        def _broken(_position: int, _frames: int) -> None:
+            raise IndexError("broken bookkeeping")
+
+        out = [
+            chunk
+            async for chunk in audio_source_silence_keepalive(
+                _inner(),
+                _audio_format(),
+                idle_threshold_s=0.05,
+                silence_chunk_ms=10,
+                on_silence=_broken,
+            )
+        ]
+        assert out[0] == b"\x01" * 40
+        assert out[-1] == b"\x02" * 8
+        assert len(out) > 3
+        assert caplog.text.count("Error handling inserted silence") == 1
+
+    @pytest.mark.asyncio
     async def test_completes_when_inner_finishes(self) -> None:
         """The wrapper completes once the inner generator is exhausted."""
         from music_assistant.helpers.audio import (  # noqa: PLC0415
@@ -862,7 +922,7 @@ class TestAudioSourceSilenceKeepalive:
             yield b"audio"
 
         async def _keepalive(
-            inner: AsyncGenerator[bytes], pcm_format: AudioFormat
+            inner: AsyncGenerator[bytes], pcm_format: AudioFormat, **_: object
         ) -> AsyncGenerator[bytes]:
             wrapped_formats.append(pcm_format)
             async for chunk in inner:

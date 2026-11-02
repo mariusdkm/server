@@ -17,10 +17,14 @@ from .media_capabilities import (
 from .provider import Provider
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
     from music_assistant_models.enums import RepeatMode, SourceControl
     from music_assistant_models.media_items import AudioSource
     from music_assistant_models.playback_progress_report import MediaItemPlaybackProgressReport
     from music_assistant_models.streamdetails import StreamDetails
+
+    from music_assistant.helpers.live_timing import LiveTiming
 
 
 # separator between the owning provider's instance_id and the provider-scoped engine id;
@@ -153,6 +157,38 @@ class PluginProvider(
         :param streamdetails: Stream details of the active AudioSource.
         """
         return None
+
+    def get_audio_source_timing(self, streamdetails: StreamDetails) -> LiveTiming | None:
+        """
+        Return the play times of a live AudioSource stream, if its source provides them.
+
+        Players that schedule audio themselves (e.g. Sendspin) use these instead of their
+        own timeline, so the audio plays when the source intends. Return None (the default)
+        to have the stream scheduled as it arrives.
+
+        :param streamdetails: Stream details of the active AudioSource stream.
+        """
+        return None
+
+    def on_audio_source_silence(
+        self,
+        streamdetails: StreamDetails,
+        stream: AsyncGenerator[bytes],
+        position: int,
+        frames: int,
+    ) -> None:
+        """
+        Handle silence the server inserts into a ``StreamType.CUSTOM`` AudioSource stream.
+
+        The server keeps the stream flowing with silence while the plugin yields nothing,
+        see ``get_audio_sources``. Plugins that time their stream account for it here.
+
+        :param streamdetails: Stream details of the AudioSource stream.
+        :param stream: The stream ``get_audio_stream`` returned, which the silence went into.
+            Stream details can be shared by successive streams of the same source.
+        :param position: Frames the plugin yielded before the silence.
+        :param frames: Frames of silence inserted.
+        """
 
     async def on_source_control(
         self,
