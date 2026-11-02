@@ -212,7 +212,7 @@ from music_assistant.helpers.util import (
     parse_title_and_version,
     remove_file,
 )
-from music_assistant.models.media_capabilities import AudioStreamMixin
+from music_assistant.models.media_capabilities import AudioSourceMixin, AudioStreamMixin
 from music_assistant.models.music_provider import MusicProvider, ProviderStreamLimitError
 
 if TYPE_CHECKING:
@@ -5907,7 +5907,13 @@ class StreamsAudio:
                 streamdetails, seek_position=seek_position if streamdetails.can_seek else 0
             )
             return audio_source_silence_keepalive(
-                audio_source, arriving_audio_format(streamdetails)
+                audio_source,
+                arriving_audio_format(streamdetails),
+                on_silence=(
+                    partial(provider.on_audio_source_silence, streamdetails, audio_source)
+                    if isinstance(provider, AudioSourceMixin)
+                    else None
+                ),
             )
         if streamdetails.stream_type == StreamType.NAMED_PIPE:
             assert isinstance(streamdetails.path, str)  # for type checking
