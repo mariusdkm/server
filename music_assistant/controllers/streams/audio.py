@@ -189,6 +189,7 @@ from music_assistant.helpers.util import (
 )
 from music_assistant.models.media_capabilities import AudioStreamMixin
 from music_assistant.models.music_provider import MusicProvider, ProviderStreamLimitError
+from music_assistant.models.plugin import PluginProvider
 
 if TYPE_CHECKING:
     from music_assistant_models.media_items import MediaItemType, ProviderMapping
@@ -5266,7 +5267,13 @@ class StreamsAudio:
                 streamdetails, seek_position=seek_position if streamdetails.can_seek else 0
             )
             return audio_source_silence_keepalive(
-                audio_source, arriving_audio_format(streamdetails)
+                audio_source,
+                arriving_audio_format(streamdetails),
+                on_silence=(
+                    partial(provider.on_audio_source_silence, streamdetails, audio_source)
+                    if isinstance(provider, PluginProvider)
+                    else None
+                ),
             )
         if streamdetails.stream_type == StreamType.NAMED_PIPE:
             assert isinstance(streamdetails.path, str)  # for type checking

@@ -11,6 +11,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, cast
+from weakref import WeakKeyDictionary
 
 from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import (
@@ -44,6 +45,7 @@ from music_assistant.helpers.config_entries import (
     create_publish_name_template_entry,
     resolve_publish_name,
 )
+from music_assistant.helpers.live_timing import LiveTiming
 from music_assistant.helpers.named_pipe import AsyncNamedPipeWriter
 from music_assistant.helpers.process import AsyncProcess, check_output
 from music_assistant.helpers.util import interface_name_for_ip
@@ -55,9 +57,10 @@ from music_assistant.providers.airplay_receiver.helpers import (
 )
 from music_assistant.providers.airplay_receiver.mdns import ReceiverAdvertiser
 from music_assistant.providers.airplay_receiver.metadata import MetadataReader
+from music_assistant.providers.airplay_receiver.timed_pipe import TimedPipeReader
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import AsyncGenerator, Callable, Iterable
 
     from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.event import MassEvent
@@ -69,9 +72,6 @@ if TYPE_CHECKING:
 SUPPORTED_FEATURES = {ProviderFeature.AUDIO_SOURCE}
 
 CONF_AIRPLAY2 = "airplay2"
-
-# seconds the silence nudge waits for the audio pipe's consumer to reattach
-AUDIO_PIPE_READER_TIMEOUT = 1.0
 
 
 def airplay_receiver_ports(instance_id: str, player_ids: Iterable[str]) -> dict[str, int]:
@@ -126,6 +126,9 @@ class _ReceiverDaemon:
     runner_task: asyncio.Task[None] | None = None
     started: asyncio.Event = field(default_factory=asyncio.Event)
     metadata_reader: MetadataReader | None = None
+    audio_reader: TimedPipeReader | None = None
+    # the stream reading the audio and the play times of what it read
+    audio_stream: tuple[StreamDetails, LiveTiming] | None = None
     runner_error_count: int = 0
     stop_called: bool = False
     # Currently active player (the one currently playing or selected)
@@ -175,6 +178,10 @@ class AirPlayReceiverProvider(PluginProvider):
         super().__init__(mass, manifest, config, SUPPORTED_FEATURES)
         self._shairport_bin: str | None = None
         self._daemons: dict[str, _ReceiverDaemon] = {}
+        # each stream's own timing: successive streams of a receiver share their stream details
+        self._stream_timings: WeakKeyDictionary[AsyncGenerator[bytes], LiveTiming] = (
+            WeakKeyDictionary()
+        )
         # players whose daemon gave up permanently; skipped by reconcile until the
         # player re-registers or the provider reloads
         self._failed_player_ids: set[str] = set()
@@ -308,10 +315,39 @@ class AirPlayReceiverProvider(PluginProvider):
             audio_format=self._audio_format,
             decoded_audio_format=self._decoded_audio_format,
             media_type=MediaType.AUDIO_SOURCE,
-            stream_type=StreamType.NAMED_PIPE,
-            path=daemon.audio_pipe.path,
+            stream_type=StreamType.CUSTOM,
             stream_metadata=daemon.stream_metadata,
+            # the sender paces its audio already; pacing it again holds back the refill
+            # after every pause until it is too late to play
+            extra_input_args=["-readrate", "0"],
         )
+
+    def get_audio_stream(
+        self, streamdetails: StreamDetails, seek_position: int = 0
+    ) -> AsyncGenerator[bytes]:
+        """Return the PCM audio the receiver gets from its AirPlay client."""
+        timing = LiveTiming(self._decoded_audio_format.sample_rate)
+        stream = self._iter_audio(streamdetails, timing)
+        self._stream_timings[stream] = timing
+        return stream
+
+    def get_audio_source_timing(self, streamdetails: StreamDetails) -> LiveTiming | None:
+        """Return the play times of a receiver's audio stream, if the daemon sends them."""
+        daemon = self._daemons.get(streamdetails.item_id)
+        if daemon is None or daemon.audio_reader is None or not daemon.audio_reader.timed:
+            return None
+        return self._get_stream_timing(streamdetails)
+
+    def on_audio_source_silence(
+        self,
+        streamdetails: StreamDetails,
+        stream: AsyncGenerator[bytes],
+        position: int,
+        frames: int,
+    ) -> None:
+        """Account for silence the server inserts while the AirPlay client sends nothing."""
+        if (timing := self._stream_timings.get(stream)) is not None:
+            timing.add_silence(position, frames)
 
     async def on_source_control(
         self,
@@ -617,6 +653,14 @@ class AirPlayReceiverProvider(PluginProvider):
                 daemon.metadata_pipe.path, self.logger, partial(self._on_metadata_update, daemon)
             )
             await daemon.metadata_reader.start()
+            # drained from the start, so shairport-sync never blocks on the audio pipe
+            daemon.audio_reader = TimedPipeReader(
+                daemon.audio_pipe.path,
+                self._decoded_audio_format.sample_rate,
+                self._decoded_audio_format.channels * self._decoded_audio_format.bit_depth // 8,
+                self.logger,
+            )
+            await daemon.audio_reader.start()
 
             await shairport.start()
 
@@ -645,6 +689,9 @@ class AirPlayReceiverProvider(PluginProvider):
             # Stop metadata reader
             if daemon.metadata_reader:
                 await daemon.metadata_reader.stop()
+            if daemon.audio_reader:
+                await daemon.audio_reader.stop()
+                daemon.audio_reader = None
 
             # the services end with the process that provides them
             if daemon.advertiser:
@@ -791,27 +838,6 @@ class AirPlayReceiverProvider(PluginProvider):
             return ""
         return f'\tinterface = "{iface_name}";\n'
 
-    async def _write_silence_to_unblock_stream(self, daemon: _ReceiverDaemon) -> None:
-        """
-        Write silence to a receiver's audio pipe to unblock ffmpeg.
-
-        When shairport-sync stops writing but ffmpeg is still reading,
-        writing silence will cause ffmpeg to output a chunk, which lets the
-        outer consumer make forward progress so the queue's cmd_stop can
-        close the stream cleanly.
-
-        We write enough silence (1 second) to ensure ffmpeg outputs at least one chunk.
-        """
-        self.logger.debug("Writing silence to audio pipe to unblock stream")
-        fmt = self._decoded_audio_format
-        silence = b"\x00" * (fmt.sample_rate * fmt.channels * fmt.bit_depth // 8)
-        # the consumer reopens the pipe shortly after shairport-sync drops it, so the
-        # nudge waits for it to come back instead of landing in that gap
-        if not await daemon.audio_pipe.wait_for_reader(AUDIO_PIPE_READER_TIMEOUT):
-            self.logger.debug("No reader on the audio pipe, skipping the silence write")
-            return
-        await daemon.audio_pipe.write(silence)
-
     def _clear_active_player(self, daemon: _ReceiverDaemon) -> None:
         """
         Clear a receiver's active player.
@@ -919,9 +945,6 @@ class AirPlayReceiverProvider(PluginProvider):
             current_player_id = daemon.in_use_by_player
             # Clear active player state (also clears in_use_by_player)
             self._clear_active_player(daemon)
-            # Write silence to the pipe so ffmpeg can produce a chunk and notice the
-            # stream has stopped; the stop command below closes the generator path.
-            self.mass.create_task(self._write_silence_to_unblock_stream(daemon))
             # Track the stop so a new session cannot overtake it.
             if current_player_id:
                 daemon.pending_stop_task = self.mass.create_task(
@@ -1079,3 +1102,26 @@ class AirPlayReceiverProvider(PluginProvider):
         if bind_ip := await self.mass.streams.get_source_ip():
             lines.append(f'address = "{bind_ip}";')
         return "".join(f"\t{line}\n" for line in lines)
+
+    async def _iter_audio(
+        self, streamdetails: StreamDetails, timing: LiveTiming
+    ) -> AsyncGenerator[bytes]:
+        """Yield a receiver's audio, recording the play time of each frame in ``timing``."""
+        daemon = self._daemons.get(streamdetails.item_id)
+        if daemon is None or daemon.audio_reader is None:
+            raise AudioError(f"AirPlay receiver {streamdetails.item_id} is not running")
+        daemon.audio_stream = (streamdetails, timing)
+        try:
+            async for chunk in daemon.audio_reader.iter_audio(timing):
+                yield chunk
+        finally:
+            if daemon.audio_stream and daemon.audio_stream[1] is timing:
+                daemon.audio_stream = None
+
+    def _get_stream_timing(self, streamdetails: StreamDetails) -> LiveTiming | None:
+        """Return the timing of the receiver stream opened with these exact stream details."""
+        daemon = self._daemons.get(streamdetails.item_id)
+        if daemon is None or daemon.audio_stream is None:
+            return None
+        stream, timing = daemon.audio_stream
+        return timing if stream is streamdetails else None
