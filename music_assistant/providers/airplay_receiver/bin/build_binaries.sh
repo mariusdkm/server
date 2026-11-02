@@ -55,6 +55,12 @@ build_linux() {
                 libavcodec-dev \
                 libavformat-dev \
                 libswresample-dev \
+                libplist-dev \
+                libplist-utils \
+                libsodium-dev \
+                libgcrypt20-dev \
+                uuid-dev \
+                xxd \
                 ca-certificates
 
             # Fetch the pinned tag and verify it against the commit SHA from Dockerfile.base
@@ -65,6 +71,7 @@ build_linux() {
             git fetch --depth 1 origin refs/tags/${SHAIRPORT_VERSION}
             git checkout FETCH_HEAD
             test \"\$(git rev-parse HEAD)\" = \"${SHAIRPORT_SHA}\"
+            git apply /output/patches/*.patch
 
             # Configure and build
             # Build with tinysvcmdns (lightweight embedded mDNS, no external daemon needed)
@@ -77,6 +84,7 @@ build_linux() {
                 --with-tinysvcmdns \
                 --with-ssl=openssl \
                 --with-stdout \
+                --with-airplay-2 \
                 --sysconfdir=/etc
 
             make -j\$(nproc)
@@ -121,6 +129,9 @@ build_macos() {
     brew list libconfig &> /dev/null || brew install libconfig
     brew list libdaemon &> /dev/null || brew install libdaemon
     brew list ffmpeg &> /dev/null || brew install ffmpeg
+    brew list libplist &> /dev/null || brew install libplist
+    brew list libsodium &> /dev/null || brew install libsodium
+    brew list libgcrypt &> /dev/null || brew install libgcrypt
 
     # Create temp directory
     TEMP_DIR=$(mktemp -d)
@@ -133,6 +144,7 @@ build_macos() {
     git fetch --depth 1 origin "refs/tags/${SHAIRPORT_VERSION}"
     git checkout FETCH_HEAD
     test "$(git rev-parse HEAD)" = "${SHAIRPORT_SHA}"
+    git apply "${SCRIPT_DIR}"/patches/*.patch
 
     autoreconf -fi
 
@@ -151,7 +163,8 @@ build_macos() {
         --without-dns-sd \
         --with-tinysvcmdns \
         --with-libdaemon \
-        PKG_CONFIG_PATH="$(brew --prefix openssl)/lib/pkgconfig:$(brew --prefix libconfig)/lib/pkgconfig:$(brew --prefix ffmpeg)/lib/pkgconfig" \
+        --with-airplay-2 \
+        PKG_CONFIG_PATH="$(brew --prefix openssl)/lib/pkgconfig:$(brew --prefix libconfig)/lib/pkgconfig:$(brew --prefix ffmpeg)/lib/pkgconfig:$(brew --prefix libplist)/lib/pkgconfig:$(brew --prefix libsodium)/lib/pkgconfig:$(brew --prefix libgcrypt)/lib/pkgconfig" \
         LDFLAGS="-L$(brew --prefix)/lib" \
         CFLAGS="-I$(brew --prefix)/include" \
         LIBS="-lm -lpthread -lssl -lcrypto -lconfig -lpopt"
