@@ -122,6 +122,13 @@ release. Each one is a change submitted to shairport-sync, carried until a relea
 
 - `0001-mdns-metadata-backend.patch`: a `metadata` mDNS backend, so the server can advertise
   the AirPlay 2 receiver itself (mikebrady/shairport-sync#TODO).
+- `0002-blockaudio-backend.patch`: a `blockaudio` output, which writes the audio to a pipe
+  in blocks that carry their play times, so the server knows when the sender wants each
+  frame played (mikebrady/shairport-sync#TODO).
+- `0003-play-time-fixes.patch`: two fixes to the play times the player hands its output:
+  the time of the first played frame when it skips the start of a late packet
+  (mikebrady/shairport-sync#2335, merged after 5.6.2), and 0 instead of an uninitialised
+  value when the time isn't known (mikebrady/shairport-sync#TODO).
 
 Remove a patch when bumping to a release that contains it.
 
