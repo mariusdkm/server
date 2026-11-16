@@ -138,9 +138,11 @@ RUN PYAV_VERSION=$(python -c "import json; reqs=json.load(open('/tmp/sendspin_ma
 
 # Build shairport-sync (airplay receiver provider) from source on top of the FFmpeg build,
 # so its ALAC decoder links against the FFmpeg libraries this image ships: an AirPlay 2
-# build with stdout/pipe outputs and a metadata pipe. It needs no mDNS daemon: it hands its
-# service to the provider over the metadata pipe, and the provider publishes it. Its
-# AirPlay 2 clock comes from the AirPlay provider's PTP daemon, which can stand in for nqptp.
+# build with stdout/pipe/blockaudio outputs and a metadata pipe. The blockaudio output's
+# blocks of audio carry their play times, so the server plays each frame when the sender
+# wants it. It needs no mDNS daemon: it hands its service to the provider over the metadata
+# pipe, and the provider publishes it. Its AirPlay 2 clock comes from the AirPlay provider's
+# PTP daemon, which can stand in for nqptp.
 FROM ffmpeg-builder AS shairport-builder
 
 # the FFmpeg build already provides the compiler, git, pkg-config and OpenSSL
@@ -158,16 +160,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xxd \
     && rm -rf /var/lib/apt/lists/*
 
-# Tags are mutable, so the fetched tag is verified against the pinned SHA. Renovate bumps
-# both together.
-# renovate: datasource=github-tags depName=mikebrady/shairport-sync
-ARG SHAIRPORT_VERSION=5.6.3
-ARG SHAIRPORT_SHA=7ce90d89529dd760488f20592a7cbff626672f6c
+# The blockaudio output is on shairport-sync's development branch until 5.7 is released,
+# so its commit is fetched by SHA. TODO: back to the 5.7 tag (and Renovate) once released.
+ARG SHAIRPORT_VERSION=5.7-dev
+ARG SHAIRPORT_SHA=81eb692ebc5e905d80c1f30654a102197ee188c5
 RUN set -x \
     && git init /tmp/shairport-sync \
     && cd /tmp/shairport-sync \
     && git remote add origin https://github.com/mikebrady/shairport-sync.git \
-    && git fetch --depth 1 origin refs/tags/${SHAIRPORT_VERSION} \
+    && git fetch --depth 1 origin ${SHAIRPORT_SHA} \
     && git checkout FETCH_HEAD \
     && test "$(git rev-parse HEAD)" = "${SHAIRPORT_SHA}" \
     # without git metadata the binary reports its release version (checked by the
@@ -176,6 +177,7 @@ RUN set -x \
     && autoreconf -fi \
     && ./configure \
         --with-pipe \
+        --with-blockaudio \
         --with-metadata \
         --with-metadata-pipe \
         --with-ffmpeg \
@@ -347,6 +349,7 @@ COPY --from=pyav-builder /wheels/ /usr/local/share/pyav-wheels/
 # available.
 RUN ldconfig && ffmpeg -version && ffprobe -version \
     && shairport-sync --version | tee /dev/stderr | grep -q -- "-AirPlay2-smi11-" \
+    && shairport-sync --version | grep -q -- "-blockaudio-" \
     && python -m pip install --no-cache-dir --no-index --no-deps \
         --target /tmp/pyav-check /usr/local/share/pyav-wheels/av*.whl \
     && PYTHONPATH=/tmp/pyav-check python -c "import av; print(av.library_versions)" \

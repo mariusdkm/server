@@ -8,7 +8,9 @@ The Docker image builds it for AirPlay 2, but the configuration runs it as class
 ## Docker
 
 The base image (`Dockerfile.base`, `shairport-builder` stage) builds shairport-sync from
-source against the image's own FFmpeg. The version and commit are pinned there.
+source against the image's own FFmpeg. The version and commit are pinned there. It also builds
+the `blockaudio` output, whose blocks of audio carry their play times (`block_audio.py` reads
+them); that output is on shairport-sync's development branch until 5.7 is released.
 
 ## Local development
 
