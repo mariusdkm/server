@@ -1,0 +1,758 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Marius DKM <mariusdkm@gmail.com>
+Date: Mon, 16 Nov 2026 17:37:17 +0100
+Subject: [PATCH] Add a blockaudio backend that writes timed blocks of audio to
+ a pipe
+
+The blockaudio backend writes the audio to a named pipe as a sequence of records. Each record is
+a 40-byte header followed by a block of audio. The header carries a version, its own length, the
+payload length, a sequence number, a CRC-32 of the header, flags (timed, flush, stop), the
+encoded output format, the RTP timestamp of the first frame and the time at which it should be
+played. Later versions only append fields, so older readers can skip what they don't know.
+
+This lets a reader that schedules the audio itself play it in sync with the sender's other
+AirPlay receivers, and see every change of format as it happens. The format is documented in
+"ADVANCED TOPICS/BlockAudio.md".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ADVANCED TOPICS/BlockAudio.md | 156 +++++++++++++
+ ADVANCED TOPICS/README.md     |   1 +
+ CONFIGURATION FLAGS.md        |   2 +
+ Makefile.am                   |   4 +
+ audio.c                       |   6 +
+ audio_blockaudio.c            | 403 ++++++++++++++++++++++++++++++++++
+ common.c                      |   3 +
+ common.h                      |   1 +
+ configure.ac                  |   6 +
+ scripts/shairport-sync.conf   |  13 ++
+ tests/configure_test.sh       |   3 +
+ 11 files changed, 598 insertions(+)
+ create mode 100644 ADVANCED TOPICS/BlockAudio.md
+ create mode 100644 audio_blockaudio.c
+
+diff --git a/ADVANCED TOPICS/BlockAudio.md b/ADVANCED TOPICS/BlockAudio.md
+new file mode 100644
+index 0000000..2c6b6e3
+--- /dev/null
++++ b/ADVANCED TOPICS/BlockAudio.md
+@@ -0,0 +1,156 @@
++# Block Audio Output
++
++The `blockaudio` backend writes the audio to a named pipe, like the `pipe` backend, but in
++records: each block of audio is preceded by a header that gives its format, its RTP timestamp and
++the time at which its first frame should be played. A reader can then schedule the audio itself,
++for example to keep its own outputs in sync with the source's other AirPlay speakers, and it sees
++every change of format as it happens.
++
++Build Shairport Sync with `--with-blockaudio`, then select the backend and, optionally, the pipe:
++
++```
++general =
++{
++	output_backend = "blockaudio";
++};
++
++blockaudio =
++{
++	name = "/tmp/shairport-sync-blockaudio"; // this is the default
++};
++```
++
++The `output_rate`, `output_format` and `output_channels` settings work as for the `pipe` backend.
++
++## Records
++
++The pipe carries a sequence of records. Each record is a header, followed by `payload_length`
++bytes of audio. Header-only records have no audio.
++
++Header fields are in the host's native byte order. The play time is only meaningful on the same
++machine anyway (see [Timing](#timing)).
++
++| Offset | Size | Field | Description |
++| ---: | ---: | :--- | :--- |
++| 0 | 4 | `magic` | The bytes `SSBA`. Written as bytes, so the same on any host. |
++| 4 | 2 | `version` | `1`. |
++| 6 | 2 | `header_length` | Length of the header in bytes: `40` in version 1. |
++| 8 | 4 | `payload_length` | Length of the audio that follows, in bytes. `0` for header-only records. |
++| 12 | 4 | `sequence` | One more than in the record before, including header-only records. Wraps around. |
++| 16 | 4 | `header_crc32` | CRC-32 of the first `header_length` bytes, computed with this field set to `0`. |
++| 20 | 2 | `flags` | See below. |
++| 22 | 2 | reserved | `0`. |
++| 24 | 4 | `format` | Format of the audio, encoded as below. |
++| 28 | 4 | `rtp` | RTP timestamp of the first frame, at the source's rate. `0` if not timed. |
++| 32 | 8 | `play_time` | Time at which the first frame should be played, in nanoseconds. `0` if not timed. |
++
++The CRC-32 is the one used by zlib, Ethernet and PNG (reflected polynomial `0xEDB88320`), so it can
++be checked with, e.g., Python's `zlib.crc32()`.
++
++The flags are:
++
++| Bit | Name | Meaning |
++| ---: | :--- | :--- |
++| 0 | `timed` | `rtp` and `play_time` are valid. Records that are not timed are silence inserted by Shairport Sync. |
++| 1 | `flush` | Discard any audio received but not yet played, e.g. after the source seeks or pauses. |
++| 2 | `stop` | The play session has ended. |
++
++Other bits are reserved and are `0`. Flush and stop are sent in header-only records, and both may
++be set in the same record.
++
++### Format
++
++`format` is Shairport Sync's encoded output format:
++
++| Bits | Content |
++| :--- | :--- |
++| 0–5 | Sample format, see below. |
++| 6–24 | Frames per second, divided by 2. |
++| 25–31 | Number of channels. |
++
++The audio is interleaved. The sample formats are:
++
++| Value | Format | Bytes per sample |
++| ---: | :--- | ---: |
++| 1 | `S8` | 1 |
++| 2 | `U8` | 1 |
++| 3 | `S16_LE` | 2 |
++| 4 | `S16_BE` | 2 |
++| 5 | `S24_LE` (in 32 bits) | 4 |
++| 6 | `S24_BE` (in 32 bits) | 4 |
++| 7 | `S24_3LE` | 3 |
++| 8 | `S24_3BE` | 3 |
++| 9 | `S32_LE` | 4 |
++| 10 | `S32_BE` | 4 |
++
++Header-only records carry the current format, or `0` if no format has been set yet.
++
++### Later Versions
++
++Later versions only append fields after the ones above, which keep their offsets and meanings. A
++reader that knows version 1 can read any later version: it uses the fields it knows and skips the
++rest of the header using `header_length`.
++
++## Timing
++
++The frames of each record follow on directly from those of the record before, so frame `n` of a
++timed record should be played at `play_time + n × 1,000,000,000 / rate` nanoseconds. A record that
++is not timed plays straight after the record before it.
++
++The play time is taken from the clock Shairport Sync uses internally: `CLOCK_MONOTONIC_RAW` (or
++`CLOCK_MONOTONIC` if that is not available) on Linux and the BSDs, and `mach_absolute_time()` on
++macOS. A reader must compare it with the same clock, so it has to run on the same machine (or in a
++container on the same kernel).
++
++The RTP timestamp can be matched against the RTP timestamps in the [metadata](Metadata.md), e.g. to
++know which track a block belongs to.
++
++## Reading the Pipe
++
++* **Keep reading.** Read the pipe continuously from start-up, whether or not anything is playing.
++  While the pipe is full, Shairport Sync waits to write the next record, which holds up the
++  player, as with the `pipe` backend.
++* **Flush and stop can arrive late.** Shairport Sync never waits to write them. If a record is
++  being written at that moment, the marker follows straight after it. If the pipe is full, it is
++  written before the next record instead, so a reader that keeps the pipe drained gets it at once.
++  A late flush and stop may arrive together in one record.
++* **End of file.** If a write fails, or the play session is torn down while a record is being
++  written, Shairport Sync closes its end of the pipe instead of finishing the record, and reopens
++  it when the next block of audio is ready. A reader that gets end-of-file should discard any
++  partial record and treat it as a flush, then open the pipe again.
++* **Resynchronising.** A reader that starts reading a pipe that already has data in it, e.g. after
++  a restart, may start in the middle of a record. To find the start of the next one, search for
++  `SSBA` and check `header_crc32`. Optionally, check that the next record begins exactly
++  `header_length + payload_length` bytes later. Audio is full of arbitrary bytes, so don't trust a
++  header whose CRC doesn't match. Gaps can be detected from `sequence`.
++
++### Example
++
++A minimal reader in Python:
++
++```python
++import struct, zlib
++
++HEADER = struct.Struct("=4sHHIIIHHIIQ")  # native byte order, no padding
++
++def read_exactly(pipe, n):
++    data = pipe.read(n)
++    if len(data) < n:
++        raise EOFError  # discard the partial record, treat it as a flush, reopen the pipe
++    return data
++
++with open("/tmp/shairport-sync-blockaudio", "rb") as pipe:
++    while True:
++        fixed = read_exactly(pipe, HEADER.size)
++        (magic, version, header_length, payload_length, sequence, crc,
++         flags, _, fmt, rtp, play_time) = HEADER.unpack(fixed)
++        if magic != b"SSBA" or header_length < HEADER.size:
++            raise ValueError("lost sync: search for the next SSBA")  # see above
++        header = bytearray(fixed + read_exactly(pipe, header_length - HEADER.size))
++        header[16:20] = bytes(4)
++        if zlib.crc32(header) != crc:
++            raise ValueError("lost sync: search for the next SSBA")
++        audio = read_exactly(pipe, payload_length)
++        channels, rate, sample_format = fmt >> 25, ((fmt >> 6) & 0x7FFFF) * 2, fmt & 0x3F
++        # ... schedule `audio` to start at `play_time` if flags & 1, handle flush/stop ...
++```
+diff --git a/ADVANCED TOPICS/README.md b/ADVANCED TOPICS/README.md
+index 8ee3b4a..5f64d4f 100644
+--- a/ADVANCED TOPICS/README.md
++++ b/ADVANCED TOPICS/README.md
+@@ -5,6 +5,7 @@ Here you will find links to some advanced features and things you can do with Sh
+ * [Metadata](Metadata.md).
+ * [Events](Events.md).
+ * [Statistics](Statistics.md).
++* [Block Audio Output](BlockAudio.md) – audio in blocks through a pipe, each with its format and the time at which it should be played, so a reader can schedule it itself.
+ * [Running Multiple AirPlay 2 Instances](RunningMultipleInstances.md) on one host – one independent AirPlay 2 zone per room from a single machine, VM, or set of containers.
+ * [Splitting a Surround Card into Per-Room Outputs](SplittingASurroundCard.md) – carve one multichannel ALSA card into several independent stereo outputs, one per room.
+ * Setting up an [MQTT](../MQTT.md) system.
+diff --git a/CONFIGURATION FLAGS.md b/CONFIGURATION FLAGS.md
+index cf322a3..5f3b9b1 100644
+--- a/CONFIGURATION FLAGS.md
++++ b/CONFIGURATION FLAGS.md
+@@ -27,6 +27,7 @@ To build Shairport Sync for AirPlay 2, include the `--with-airplay-2` option in
+ | `--with-ao` |
+ | `--with-stdout` |
+ | `--with-pipe` |
++| `--with-blockaudio` |
+
+ Shairport Sync has a number of different "backends" that send audio to an onward destination, e.g. an audio subsystem for output to a Digital to Audio Converter and thence to loudspeakers, or to a pipe for further processing. You can use configuration options to include support for multiple backends at build time and select one of them at runtime.
+
+@@ -39,6 +40,7 @@ Here are the audio backend configuration options:
+ - `--with-ao` Output to the [libao](https://xiph.org/ao/) system. No synchronisation.
+ - `--with-stdout` Include an optional backend module to enable raw audio to be output through standard output (`STDOUT`).
+ - `--with-pipe` Include an optional backend module to enable raw audio to be output through a unix pipe.
++- `--with-blockaudio` Include an optional backend module that outputs audio through a unix pipe in blocks, each with a header giving its format and the time at which it should be played. See [Block Audio Output](ADVANCED%20TOPICS/BlockAudio.md).
+
+ ### PulseAudio and PipeWire
+ If your system uses either PipeWire or PulseAudio as sound servers, Shairport Sync must be started as a user service. This is because the PipeWire or PulseAudio services -- needed by Shairport Sync -- are user services themselves, and they must be running before Shairport Sync starts. That implies that Shairport Sync must be started as a user service.
+diff --git a/Makefile.am b/Makefile.am
+index 7f63841..1942cd7 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -119,6 +119,10 @@ if USE_PIPE
+ shairport_sync_SOURCES += audio_pipe.c
+ endif
+
++if USE_BLOCKAUDIO
++shairport_sync_SOURCES += audio_blockaudio.c
++endif
++
+ if USE_DUMMY
+ shairport_sync_SOURCES += audio_dummy.c
+ endif
+diff --git a/audio.c b/audio.c
+index 64aaeca..aa613ab 100644
+--- a/audio.c
++++ b/audio.c
+@@ -55,6 +55,9 @@ extern audio_output audio_dummy;
+ #ifdef CONFIG_PIPE
+ extern audio_output audio_pipe;
+ #endif
++#ifdef CONFIG_BLOCKAUDIO
++extern audio_output audio_blockaudio;
++#endif
+ #ifdef CONFIG_STDOUT
+ extern audio_output audio_stdout;
+ #endif
+@@ -81,6 +84,9 @@ static audio_output *outputs[] = {
+ #ifdef CONFIG_PIPE
+     &audio_pipe,
+ #endif
++#ifdef CONFIG_BLOCKAUDIO
++    &audio_blockaudio,
++#endif
+ #ifdef CONFIG_STDOUT
+     &audio_stdout,
+ #endif
+diff --git a/audio_blockaudio.c b/audio_blockaudio.c
+new file mode 100644
+index 0000000..91630b8
+--- /dev/null
++++ b/audio_blockaudio.c
+@@ -0,0 +1,403 @@
++/*
++ * blockaudio output driver. This file is part of Shairport Sync.
++ * Copyright (c) Marius DKM 2026
++ * All rights reserved.
++ *
++ * Writes the audio to a named pipe as a sequence of records, each a header followed by a block of
++ * audio. The header gives the block's format, its RTP timestamp and the time at which its first
++ * frame should be played. The format is documented in "ADVANCED TOPICS/BlockAudio.md".
++ *
++ * Permission is hereby granted, free of charge, to any person
++ * obtaining a copy of this software and associated documentation
++ * files (the "Software"), to deal in the Software without
++ * restriction, including without limitation the rights to use,
++ * copy, modify, merge, publish, distribute, sublicense, and/or
++ * sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be
++ * included in all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
++ * OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
++ * HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
++ * WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++#include "audio.h"
++#include "common.h"
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <memory.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++#include "utilities/network_utilities.h"
++
++// Header layout, version 1. Fields are in the host's byte order. Later versions only append
++// fields, so the offsets below never change.
++#define BLOCKAUDIO_MAGIC "SSBA"
++#define BLOCKAUDIO_VERSION 1
++#define BLOCKAUDIO_HEADER_LENGTH 40
++#define OFFSET_MAGIC 0
++#define OFFSET_VERSION 4
++#define OFFSET_HEADER_LENGTH 6
++#define OFFSET_PAYLOAD_LENGTH 8
++#define OFFSET_SEQUENCE 12
++#define OFFSET_HEADER_CRC32 16
++#define OFFSET_FLAGS 20
++#define OFFSET_RESERVED 22
++#define OFFSET_FORMAT 24
++#define OFFSET_RTP 28
++#define OFFSET_PLAY_TIME 32
++
++enum {
++  BLOCKAUDIO_FLAG_TIMED = 1, // rtp and play_time are valid
++  BLOCKAUDIO_FLAG_FLUSH = 2, // discard audio received but not yet played
++  BLOCKAUDIO_FLAG_STOP = 4,  // the play session has ended
++};
++
++// a header-only record must be written atomically by a single non-blocking write()
++#if BLOCKAUDIO_HEADER_LENGTH > PIPE_BUF
++#error "a blockaudio header must not be longer than PIPE_BUF"
++#endif
++
++static int fd = -1;
++static int warned = 0;
++static int32_t encoded_format = 0;
++static unsigned int bytes_per_frame = 0;
++static uint32_t sequence = 0;
++
++static uint8_t *record_buf = NULL;
++static size_t record_buf_size = 0;
++
++// fd, sequence and record_buf are only used with this held.
++static pthread_mutex_t record_lock = PTHREAD_MUTEX_INITIALIZER;
++
++// flush() is called with the player's flush_mutex held and must not block, so a flush or stop
++// marker that can't be written at once is left here and written before the next record.
++// Never held across a write.
++static pthread_mutex_t pending_lock = PTHREAD_MUTEX_INITIALIZER;
++static uint16_t pending_flags = 0;
++
++static char *pipename = NULL;
++static char *default_pipe_name = "/tmp/shairport-sync-blockaudio";
++
++// CRC-32 with the parameters zlib's crc32() uses (reflected polynomial 0xEDB88320, initial value
++// and final XOR 0xFFFFFFFF), so readers can check it with a standard library. Computed bit by bit:
++// it only ever covers a header.
++static uint32_t crc32_of(const uint8_t *p, size_t length) {
++  uint32_t crc = 0xFFFFFFFF;
++  for (size_t i = 0; i < length; i++) {
++    crc ^= p[i];
++    for (int bit = 0; bit < 8; bit++)
++      crc = (crc >> 1) ^ (0xEDB88320 & (0 - (crc & 1)));
++  }
++  return crc ^ 0xFFFFFFFF;
++}
++
++// call with record_lock held. Consumes a sequence number.
++static void put_header(uint8_t *p, uint16_t flags, uint32_t payload_length, uint32_t rtp,
++                       uint64_t play_time) {
++  uint16_t version = BLOCKAUDIO_VERSION;
++  uint16_t header_length = BLOCKAUDIO_HEADER_LENGTH;
++  uint16_t reserved = 0;
++  uint32_t crc = 0;
++  uint32_t format = (uint32_t)encoded_format;
++  memcpy(p + OFFSET_MAGIC, BLOCKAUDIO_MAGIC, 4);
++  memcpy(p + OFFSET_VERSION, &version, sizeof(version));
++  memcpy(p + OFFSET_HEADER_LENGTH, &header_length, sizeof(header_length));
++  memcpy(p + OFFSET_PAYLOAD_LENGTH, &payload_length, sizeof(payload_length));
++  memcpy(p + OFFSET_SEQUENCE, &sequence, sizeof(sequence));
++  memcpy(p + OFFSET_HEADER_CRC32, &crc, sizeof(crc));
++  memcpy(p + OFFSET_FLAGS, &flags, sizeof(flags));
++  memcpy(p + OFFSET_RESERVED, &reserved, sizeof(reserved));
++  memcpy(p + OFFSET_FORMAT, &format, sizeof(format));
++  memcpy(p + OFFSET_RTP, &rtp, sizeof(rtp));
++  memcpy(p + OFFSET_PLAY_TIME, &play_time, sizeof(play_time));
++  crc = crc32_of(p, BLOCKAUDIO_HEADER_LENGTH);
++  memcpy(p + OFFSET_HEADER_CRC32, &crc, sizeof(crc));
++  sequence++;
++}
++
++static void log_write_error(int error) {
++  if ((error != EPIPE) && (warned == 0)) {
++    char errorstring[1024];
++    strerror_r(error, (char *)errorstring, sizeof(errorstring));
++    debug(1, "blockaudio: error %d writing to the pipe \"%s\": \"%s\".", error, pipename,
++          errorstring);
++    warned = 1;
++  }
++}
++
++// call with record_lock held. On failure, the pipe is closed rather than resumed mid-record, so
++// that a reader never sees the rest of a record without its start. The next play() reopens it.
++static int write_fully(const uint8_t *buf, size_t size) {
++  for (size_t done = 0; done < size;) {
++    ssize_t n = write(fd, buf + done, size - done); // a cancellation point
++    if (n < 0) {
++      if (errno == EINTR)
++        continue;
++      int error = errno;
++      log_write_error(error);
++      safe_socket_close(&fd);
++      return -1;
++    }
++    done += n;
++  }
++  return 0;
++}
++
++// call with record_lock held. If nonblocking, a full pipe leaves the markers pending.
++static void write_pending_markers(int nonblocking) {
++  pthread_mutex_lock(&pending_lock);
++  uint16_t flags = pending_flags;
++  pthread_mutex_unlock(&pending_lock);
++  if (flags == 0)
++    return;
++  if (fd >= 0) { // without a reader, there is nothing to mark
++    uint8_t header[BLOCKAUDIO_HEADER_LENGTH];
++    uint32_t saved_sequence = sequence;
++    put_header(header, flags, 0, 0, 0);
++    if (nonblocking) {
++      // a pipe write of up to PIPE_BUF bytes is atomic: all of the header, or EAGAIN.
++      int fd_flags = fcntl(fd, F_GETFL);
++      if ((fd_flags == -1) || (fcntl(fd, F_SETFL, fd_flags | O_NONBLOCK) == -1)) {
++        sequence = saved_sequence; // try again before the next record
++        return;
++      }
++      ssize_t n;
++      do {
++        n = write(fd, header, sizeof(header));
++      } while ((n < 0) && (errno == EINTR));
++      int error = errno;
++      if (fcntl(fd, F_SETFL, fd_flags) == -1) {
++        // records must be written in blocking mode, so start again on a fresh descriptor
++        debug(1, "blockaudio: can not make the pipe blocking again.");
++        safe_socket_close(&fd);
++      }
++      if ((n < 0) && ((error == EAGAIN) || (error == EWOULDBLOCK))) {
++        sequence = saved_sequence; // the pipe is full; the next record writes the markers
++        return;
++      }
++      if ((n < 0) && (fd >= 0)) {
++        log_write_error(error);
++        safe_socket_close(&fd);
++      }
++    } else {
++      write_fully(header, sizeof(header));
++    }
++  }
++  pthread_mutex_lock(&pending_lock);
++  pending_flags &= ~flags;
++  pthread_mutex_unlock(&pending_lock);
++}
++
++// if the player thread is cancelled in the middle of a record, close the pipe so that the reader
++// sees the end of the stream instead of the rest of the record, and release the lock.
++static void record_cleanup(void *arg) {
++  int *in_record = (int *)arg;
++  if (*in_record)
++    safe_socket_close(&fd);
++  pthread_mutex_unlock(&record_lock);
++}
++
++static int play(void *buf, int samples, int sample_type, uint32_t timestamp, uint64_t playtime) {
++  // configure() and play() are both called from the player thread
++  if (bytes_per_frame == 0) {
++    static int reported = 0;
++    if (reported == 0)
++      debug(1, "blockaudio: play() called without a valid output format.");
++    reported = 1;
++    return 0;
++  }
++  if (samples <= 0)
++    return 0;
++  size_t payload_length = (size_t)samples * bytes_per_frame;
++  if (payload_length > UINT32_MAX - BLOCKAUDIO_HEADER_LENGTH) {
++    debug(1, "blockaudio: a block of %d frames is too long for a record.", samples);
++    return 0;
++  }
++  size_t size = BLOCKAUDIO_HEADER_LENGTH + payload_length;
++  // untimed frames are silence inserted by Shairport Sync
++  int timed = (sample_type == play_samples_are_timed) && (playtime != 0);
++
++  int in_record = 0;
++  pthread_mutex_lock(&record_lock);
++  pthread_cleanup_push(record_cleanup, &in_record);
++  if (fd == -1) {
++    fd = try_to_open_pipe_for_writing(pipename);
++    if (fd >= 0)
++      warned = 0;
++  }
++  if (fd >= 0) {
++    in_record = 1;
++    write_pending_markers(0); // markers belong before this record
++    if ((fd >= 0) && (size > record_buf_size)) {
++      uint8_t *b = realloc(record_buf, size);
++      if (b == NULL) {
++        debug(1, "blockaudio: can not allocate %zu bytes for a record.", size);
++      } else {
++        record_buf = b;
++        record_buf_size = size;
++      }
++    }
++    if ((fd >= 0) && (size <= record_buf_size)) {
++      put_header(record_buf, timed ? BLOCKAUDIO_FLAG_TIMED : 0, (uint32_t)payload_length,
++                 timed ? timestamp : 0, timed ? playtime : 0);
++      memcpy(record_buf + BLOCKAUDIO_HEADER_LENGTH, buf, payload_length);
++      write_fully(record_buf, size);
++    }
++    // a flush or stop that came in while the record was being written goes out now, rather than
++    // waiting for a next record that may not come, e.g. when playback is paused.
++    write_pending_markers(0);
++    in_record = 0;
++  }
++  pthread_cleanup_pop(1);
++  return 0;
++}
++
++// queue the marker and write it at once if that can be done without blocking.
++static void write_marker(uint16_t flags) {
++  pthread_mutex_lock(&pending_lock);
++  pending_flags |= flags;
++  pthread_mutex_unlock(&pending_lock);
++  int oldState;
++  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldState); // the caller expects no cancellation
++  // if a record is being written, the next record writes the marker
++  if (pthread_mutex_trylock(&record_lock) == 0) {
++    write_pending_markers(1);
++    pthread_mutex_unlock(&record_lock);
++  }
++  pthread_setcancelstate(oldState, NULL);
++}
++
++static void flush(void) { write_marker(BLOCKAUDIO_FLAG_FLUSH); }
++
++static void stop(void) {
++  // Don't close the pipe just because a play session has stopped.
++  write_marker(BLOCKAUDIO_FLAG_STOP);
++}
++
++static int prepare(void) {
++  int result = 0;
++  // this runs on the RTSP thread: if a record is being written, the pipe is open and has a reader.
++  if (pthread_mutex_trylock(&record_lock) != 0)
++    return 0;
++  if (fd == -1)
++    fd = try_to_open_pipe_for_writing(pipename);
++  // "ENXIO  O_NONBLOCK | O_WRONLY is set, the named file is a FIFO, and no process has the FIFO
++  // open for reading." Which is okay.
++  if ((fd == -1) && (errno != ENXIO)) {
++    char errorstring[1024];
++    strerror_r(errno, (char *)errorstring, sizeof(errorstring));
++    warn("blockaudio: can not open the pipe \"%s\" -- error %d (\"%s\").", pipename, errno,
++         (char *)errorstring);
++    result = -1;
++  }
++  pthread_mutex_unlock(&record_lock);
++  return result;
++}
++
++static int init(int argc, char **argv) {
++  config.audio_backend_buffer_desired_length = 1.0;
++  config.audio_backend_latency_offset = 0;
++
++  // get settings from settings file, passing in defaults for format_set, rate_set and channel_set
++  // Note, these options may be in the "general" stanza or the named stanza
++#ifdef CONFIG_AIRPLAY_2
++  parse_audio_options("blockaudio", (1 << SPS_FORMAT_S32_LE), (1 << SPS_RATE_48000), (1 << 2));
++#else
++  parse_audio_options("blockaudio", (1 << SPS_FORMAT_S16_LE), (1 << SPS_RATE_44100), (1 << 2));
++#endif
++  if (config.cfg != NULL) {
++    const char *str;
++    if (config_lookup_non_empty_string(config.cfg, "blockaudio.name", &str))
++      pipename = (char *)str;
++  }
++
++  if (argc > 1)
++    die("too many command-line arguments to blockaudio");
++
++  if (argc == 1)
++    pipename = argv[0]; // command line argument has priority
++
++  if ((pipename) && (strcasecmp(pipename, "STDOUT") == 0))
++    die("Can't use the \"blockaudio\" backend for STDOUT.");
++
++  if (pipename == NULL)
++    pipename = default_pipe_name;
++
++  mode_t oldumask = umask(000);
++  if (mkfifo(pipename, 0666) && errno != EEXIST)
++    die("Could not create the blockaudio pipe \"%s\"", pipename);
++  umask(oldumask);
++
++  debug(1, "blockaudio pipe name is \"%s\"", pipename);
++  return 0;
++}
++
++static void deinit(void) {
++  pthread_mutex_lock(&record_lock);
++  safe_socket_close(&fd);
++  free(record_buf);
++  record_buf = NULL;
++  record_buf_size = 0;
++  pthread_mutex_unlock(&record_lock);
++}
++
++static void help(void) {
++  printf("    Provide the pipe's pathname. The default is \"%s\".\n", default_pipe_name);
++}
++
++static int32_t get_configuration(unsigned int channels, unsigned int rate, unsigned int format) {
++  // every record carries its format, so any configuration the settings allow will do
++  return search_for_suitable_configuration(channels, rate, format, NULL);
++}
++
++static int configure(int32_t requested_encoded_format, __attribute__((unused)) char **channel_map) {
++  int response = 0;
++  unsigned int bytes_per_sample =
++      sps_format_sample_size(FORMAT_FROM_ENCODED_FORMAT(requested_encoded_format));
++  unsigned int channels = CHANNELS_FROM_ENCODED_FORMAT(requested_encoded_format);
++  pthread_mutex_lock(&record_lock);
++  if ((bytes_per_sample == 0) || (channels == 0)) {
++    debug(1, "blockaudio: unsupported output format %s.",
++          short_format_description(requested_encoded_format));
++    encoded_format = 0;
++    bytes_per_frame = 0; // play() won't write anything until a valid format is configured
++    response = EINVAL;
++  } else {
++    encoded_format = requested_encoded_format;
++    bytes_per_frame = bytes_per_sample * channels;
++  }
++  pthread_mutex_unlock(&record_lock);
++  return response;
++}
++
++audio_output audio_blockaudio = {.name = "blockaudio",
++                                 .help = &help,
++                                 .init = &init,
++                                 .deinit = &deinit,
++                                 .prepare = &prepare,
++                                 .get_configuration = &get_configuration,
++                                 .configure = &configure,
++                                 .stop = &stop,
++                                 .is_running = NULL,
++                                 .flush = &flush,
++                                 .delay = NULL,
++                                 .stats = NULL,
++                                 .play = &play,
++                                 .volume = NULL,
++                                 .parameters = NULL,
++                                 .mute = NULL};
+diff --git a/common.c b/common.c
+index cdf66b9..282f0a4 100644
+--- a/common.c
++++ b/common.c
+@@ -2021,6 +2021,9 @@ char *get_version_string() {
+ #ifdef CONFIG_PIPE
+     strcat(version_string, "-pipe");
+ #endif
++#ifdef CONFIG_BLOCKAUDIO
++    strcat(version_string, "-blockaudio");
++#endif
+ #ifdef CONFIG_SOXR
+     strcat(version_string, "-soxr");
+ #endif
+diff --git a/common.h b/common.h
+index bfa6638..fb8663c 100644
+--- a/common.h
++++ b/common.h
+@@ -96,6 +96,7 @@ typedef enum {
+
+ // ensure sps_format_sample_size_array and sps_format_description_string_array are in sync with
+ // this!
++// the blockaudio backend sends these values to readers, so don't renumber existing entries.
+ typedef enum {
+   SPS_FORMAT_UNKNOWN = 0,
+   SPS_FORMAT_S8,
+diff --git a/configure.ac b/configure.ac
+index 81db6e0..133b76a 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -98,6 +98,12 @@ if test "x$with_pipe" = "xyes" ; then
+ fi
+ AM_CONDITIONAL([USE_PIPE], [test "x$with_pipe" = "xyes" ])
+
++AC_ARG_WITH([blockaudio],[AS_HELP_STRING([--with-blockaudio],[build the blockaudio backend, which writes timed blocks of audio to a unix pipe])])
++if test "x$with_blockaudio" = "xyes" ; then
++  AC_DEFINE([CONFIG_BLOCKAUDIO], 1, [Include an audio backend to output timed blocks of audio to a unix pipe.])
++fi
++AM_CONDITIONAL([USE_BLOCKAUDIO], [test "x$with_blockaudio" = "xyes" ])
++
+ # Check to see if we should include the System V initscript
+
+ AC_ARG_WITH([systemv-startup],[AS_HELP_STRING([--with-systemv-startup],[install a System V startup script during a make install])])
+diff --git a/scripts/shairport-sync.conf b/scripts/shairport-sync.conf
+index e64ea1c..a82eb4f 100644
+--- a/scripts/shairport-sync.conf
++++ b/scripts/shairport-sync.conf
+@@ -267,6 +267,19 @@ pipe =
+ //	output_channels = 2; // Specify a specific number of channels, e.g. 2, or a bracketed comma-separated list of numbers of channels, e.g. (2, 6) or "auto" -- try to match the input. Default is 2. See the "Rates, Formats and Channels" discussion above.
+ };
+
++// Parameters for the "blockaudio" audio back end, a back end that writes the audio to a unix pipe in blocks, each preceded by a header giving the block's format, its RTP timestamp and the time at which it should be played, so that a reader can schedule the audio itself. No interpolation is done. See "ADVANCED TOPICS/BlockAudio.md" for the format.
++// For this section to be operative, Shairport Sync must have been built with the following configuration flag:
++// --with-blockaudio
++blockaudio =
++{
++//	name = "/tmp/shairport-sync-blockaudio"; // this is the default
++
++//	Every block carries its format, so "auto" or multiple settings are safe here: the reader sees each change as it happens.
++//	output_rate = <rate>; // Specify a single rate, e.g. 44100, or a bracketed comma-separated list of rates, e.g. (44100, 48000, 64000) or "auto" -- try to match the input. Default is 44100 for classic AirPlay, 48000 for AirPlay 2. See the "Rates, Formats and Channels" discussion above.
++//	output_format = <format>; // Specify a format, e.g. "S16_LE", or a bracketed comma-separated list of formats, e.g. ("S32_LE", "S16_LE") or "auto". Default is "S16_LE" for classic AirPlay, "S32_LE" for AirPlay 2. See the "Rates, Formats and Channels" discussion above.
++//	output_channels = 2; // Specify a specific number of channels, e.g. 2, or a bracketed comma-separated list of numbers of channels, e.g. (2, 6) or "auto" -- try to match the input. Default is 2. See the "Rates, Formats and Channels" discussion above.
++};
++
+ // Parameters for the "stdout" audio back end, a back end that directs raw PCM audio output to STDOUT. No interpolation is done.
+ // To include support for the "stdout" backend, Shairport Sync must be built with the following configuration flag:
+ // --with-stdout
+diff --git a/tests/configure_test.sh b/tests/configure_test.sh
+index cf4d361..68ddd72 100644
+--- a/tests/configure_test.sh
++++ b/tests/configure_test.sh
+@@ -132,6 +132,9 @@ check_for_success x$1 --without-stdout --with-ssl=mbedtls x stdout
+ check_for_success x$1 --with-pipe --with-ssl=mbedtls pipe
+ check_for_success x$1 --without-pipe --with-ssl=mbedtls x pipe
+
++check_for_success x$1 --with-blockaudio --with-ssl=mbedtls blockaudio
++check_for_success x$1 --without-blockaudio --with-ssl=mbedtls x blockaudio
++
+ check_for_success x$1 --with-external-mdns --with-ssl=mbedtls external_mdns
+ check_for_success x$1 --without-external-mdns --with-ssl=mbedtls x external_mdns
+
+--
+2.54.0 (Apple Git-157)

@@ -78,6 +78,7 @@ build_linux() {
             autoreconf -fi
             ./configure \
                 --with-pipe \
+                --with-blockaudio \
                 --with-metadata \
                 --without-avahi \
                 --without-dns-sd \
@@ -156,6 +157,7 @@ build_macos() {
     # needs some mDNS backend present to function properly
     ./configure \
         --with-pipe \
+        --with-blockaudio \
         --with-metadata \
         --with-ssl=openssl \
         --with-stdout \

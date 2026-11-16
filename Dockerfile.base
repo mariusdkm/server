@@ -132,10 +132,12 @@ RUN PYAV_VERSION=$(python -c "import json; reqs=json.load(open('/tmp/sendspin_ma
 
 # Build shairport-sync (airplay receiver provider) from source against this image's
 # libraries, using the same configuration as music_assistant/providers/airplay_receiver/bin/build_binaries.sh:
-# tinysvcmdns as embedded mDNS backend (no avahi), stdout/pipe outputs and metadata support.
-# Linked against our own FFmpeg (5.x decodes with it), which the final image ships.
-# With AirPlay 2, timed by the AirPlay provider's PTP daemon and advertised by the server
-# through the "metadata" mDNS backend (patches/, until it is in a release).
+# tinysvcmdns as embedded mDNS backend (no avahi), stdout/pipe/blockaudio outputs and metadata
+# support. Linked against our own FFmpeg (5.x decodes with it), which the final image ships.
+# With AirPlay 2, timed by the AirPlay provider's PTP daemon, advertised by the server
+# through the "metadata" mDNS backend, and with the "blockaudio" output, whose blocks of audio
+# carry their play times so the server plays each frame when the sender wants it (patches/,
+# until they are in a release).
 FROM python:${PYTHON_VERSION}-slim-trixie AS shairport-builder
 
 RUN sed -i 's/^Components: .*/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources
@@ -190,6 +192,7 @@ RUN set -x \
     && autoreconf -fi \
     && ./configure \
         --with-pipe \
+        --with-blockaudio \
         --with-metadata \
         --without-avahi \
         --without-dns-sd \
@@ -352,6 +355,7 @@ COPY --from=pyav-builder /wheels/ /usr/local/share/pyav-wheels/
 # Verify FFmpeg and the custom PyAV wheel with all codec runtime libraries available.
 RUN ldconfig && ffmpeg -version && ffprobe -version \
     && shairport-sync -V | grep -q -- "-AirPlay2-smi11-" \
+    && shairport-sync -V | grep -q -- "-blockaudio-" \
     && shairport-sync -h | grep -qx "    metadata" \
     && python -m pip install --no-cache-dir --no-index --no-deps \
         --target /tmp/pyav-check /usr/local/share/pyav-wheels/av*.whl \
