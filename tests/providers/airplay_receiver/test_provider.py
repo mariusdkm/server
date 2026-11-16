@@ -563,7 +563,6 @@ def _session_provider(
     prov._ports = {connected: 7000}
     prov._audio_format = AudioFormat(content_type=ContentType.ALAC)
     prov._setup_shairport_daemon = MagicMock()  # type: ignore[method-assign]
-    prov._write_silence_to_unblock_stream = AsyncMock()  # type: ignore[method-assign]
     AirPlayReceiverProvider._start_receiver(
         prov, connected, mocks.mass.players.get_player(connected), "Receiver | Music Assistant"
     )
