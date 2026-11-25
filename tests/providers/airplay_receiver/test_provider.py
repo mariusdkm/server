@@ -961,6 +961,33 @@ async def test_a_new_hand_over_refreshes_the_published_service(
     assert aiozc.async_update_service.await_args.args[0].decoded_properties["sf"] == "0x20004"
 
 
+async def test_an_airplay_2_build_gets_both_of_its_services_published(
+    mdns_receiver: tuple[AirPlayReceiverProvider, MagicMock, MagicMock],
+) -> None:
+    """Each service type is registered on its own, refreshed on its own and withdrawn."""
+    prov, proc, aiozc = mdns_receiver
+    daemon = prov._daemons["p1"]
+    airplay = replace(_SERVICE, service_type="_airplay._tcp", name="Kitchen | Music Assistant")
+
+    await prov._publish_mdns_service(daemon, proc, _SERVICE)
+    await prov._publish_mdns_service(daemon, proc, airplay)
+    await prov._publish_mdns_service(daemon, proc, replace(airplay, txt={"flags": "0x20404"}))
+
+    registered = [call.args[0].name for call in aiozc.async_register_service.await_args_list]
+    assert registered == [
+        "0A1B2C3D4E5F@Kitchen | Music Assistant._raop._tcp.local.",
+        "Kitchen | Music Assistant._airplay._tcp.local.",
+    ]
+    updated = aiozc.async_update_service.await_args.args[0]
+    assert updated.type == "_airplay._tcp.local."
+    assert updated.decoded_properties == {"flags": "0x20404"}
+
+    await prov._unpublish_mdns_service(daemon)
+    withdrawn = {call.args[0].type for call in aiozc.async_unregister_service.await_args_list}
+    assert withdrawn == {"_raop._tcp.local.", "_airplay._tcp.local."}
+    assert not daemon.mdns_infos
+
+
 @pytest.mark.parametrize("ended", ["exited", "replaced"])
 async def test_a_hand_over_from_a_process_that_is_gone_is_not_published(
     mdns_receiver: tuple[AirPlayReceiverProvider, MagicMock, MagicMock], ended: str
@@ -976,7 +1003,7 @@ async def test_a_hand_over_from_a_process_that_is_gone_is_not_published(
     await prov._publish_mdns_service(daemon, proc, _SERVICE)
 
     aiozc.async_register_service.assert_not_awaited()
-    assert daemon.mdns_info is None
+    assert not daemon.mdns_infos
 
 
 async def test_dots_in_the_receiver_name_stay_within_its_dns_label(
@@ -1019,7 +1046,7 @@ async def test_a_failed_announcement_leaves_the_receiver_running(
 
     await prov._publish_mdns_service(daemon, proc, _SERVICE)
 
-    assert daemon.mdns_info is None
+    assert not daemon.mdns_infos
     cast("MagicMock", prov.logger).warning.assert_called_once()
 
 
@@ -1030,13 +1057,13 @@ async def test_withdrawing_the_service_says_goodbye_once(
     prov, proc, aiozc = mdns_receiver
     daemon = prov._daemons["p1"]
     await prov._publish_mdns_service(daemon, proc, _SERVICE)
-    info = daemon.mdns_info
+    info = daemon.mdns_infos["_raop._tcp"]
 
     await prov._unpublish_mdns_service(daemon)
     await prov._unpublish_mdns_service(daemon)
 
     aiozc.async_unregister_service.assert_awaited_once_with(info)
-    assert daemon.mdns_info is None
+    assert not daemon.mdns_infos
 
 
 async def test_stopping_a_receiver_withdraws_its_service(
@@ -1052,7 +1079,7 @@ async def test_stopping_a_receiver_withdraws_its_service(
     await AirPlayReceiverProvider._stop_receiver(prov, daemon)
 
     aiozc.async_unregister_service.assert_awaited_once()
-    assert daemon.mdns_info is None
+    assert not daemon.mdns_infos
 
 
 async def test_the_goodbye_follows_the_announcements_in_flight(
@@ -1075,7 +1102,7 @@ async def test_the_goodbye_follows_the_announcements_in_flight(
     announced.set()
     await asyncio.gather(publishing, withdrawing)
     aiozc.async_unregister_service.assert_awaited_once()
-    assert daemon.mdns_info is None
+    assert not daemon.mdns_infos
 
 
 def test_receiver_pipes_and_config_live_in_the_runtime_dir() -> None:

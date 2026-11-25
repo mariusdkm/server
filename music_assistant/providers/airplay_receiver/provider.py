@@ -155,8 +155,9 @@ class _ReceiverDaemon:
     # the player a failed playback start waits for, until it can play
     waiting_player_id: str | None = None
     unsubscribe_waiting: Callable[[], None] | None = None
-    # the mDNS service published on behalf of the running shairport-sync process
-    mdns_info: AsyncServiceInfo | None = None
+    # the mDNS services published on behalf of the running shairport-sync process, by
+    # service type: an AirPlay 2 build hands over _airplay._tcp next to _raop._tcp
+    mdns_infos: dict[str, AsyncServiceInfo] = field(default_factory=dict)
     mdns_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def cover_art_path(self, img_hash: str) -> str:
@@ -868,7 +869,7 @@ class AirPlayReceiverProvider(PluginProvider):
                     # answer for its host name, with addresses senders may not reach
                     server=f"ma-airplay-receiver-{self.mass.server_id[:8]}.local.",
                 )
-                if daemon.mdns_info is None:
+                if service.service_type not in daemon.mdns_infos:
                     # no probing: the name derives from this host's MAC address, and a
                     # restart would otherwise trip over the previous process's goodbye
                     announcing = await aiozc.async_register_service(
@@ -876,7 +877,7 @@ class AirPlayReceiverProvider(PluginProvider):
                     )
                 else:
                     announcing = await aiozc.async_update_service(info)
-                daemon.mdns_info = info
+                daemon.mdns_infos[service.service_type] = info
                 # hold the lock until the announcements are out: one sent after a later
                 # goodbye would bring the withdrawn service back in the senders' caches
                 await announcing
@@ -888,18 +889,17 @@ class AirPlayReceiverProvider(PluginProvider):
                 )
 
     async def _unpublish_mdns_service(self, daemon: _ReceiverDaemon) -> None:
-        """Withdraw the mDNS service published for a receiver, if any."""
+        """Withdraw the mDNS services published for a receiver, if any."""
         async with daemon.mdns_lock:
-            if daemon.mdns_info is None:
-                return
-            info, daemon.mdns_info = daemon.mdns_info, None
-            try:
-                # wait for the goodbyes, so a receiver started right after (e.g. on a reload)
-                # announces its service after them
-                await (await self.mass.discovery.aiozc.async_unregister_service(info))
-            except (ZeroconfError, OSError) as err:
-                # e.g. zeroconf already closed at shutdown
-                self.logger.debug("Unable to withdraw mDNS service %s: %s", info.name, err)
+            infos, daemon.mdns_infos = list(daemon.mdns_infos.values()), {}
+            for info in infos:
+                try:
+                    # wait for the goodbyes, so a receiver started right after (e.g. on a
+                    # reload) announces its services after them
+                    await (await self.mass.discovery.aiozc.async_unregister_service(info))
+                except (ZeroconfError, OSError) as err:
+                    # e.g. zeroconf already closed at shutdown
+                    self.logger.debug("Unable to withdraw mDNS service %s: %s", info.name, err)
 
     async def _write_silence_to_unblock_stream(self, daemon: _ReceiverDaemon) -> None:
         """
