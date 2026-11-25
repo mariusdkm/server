@@ -137,9 +137,10 @@ RUN PYAV_VERSION=$(python -c "import json; reqs=json.load(open('/tmp/sendspin_ma
 ##################################################################################################
 
 # Build shairport-sync (airplay receiver provider) from source on top of the FFmpeg build,
-# so its ALAC decoder links against the FFmpeg libraries this image ships: classic AirPlay
-# with stdout/pipe outputs and a metadata pipe. It needs no mDNS daemon: it hands its
-# service to the provider over the metadata pipe, and the provider publishes it.
+# so its ALAC decoder links against the FFmpeg libraries this image ships: an AirPlay 2
+# build with stdout/pipe outputs and a metadata pipe. It needs no mDNS daemon: it hands its
+# service to the provider over the metadata pipe, and the provider publishes it. Its
+# AirPlay 2 clock comes from the AirPlay provider's PTP daemon, which can stand in for nqptp.
 FROM ffmpeg-builder AS shairport-builder
 
 # the FFmpeg build already provides the compiler, git, pkg-config and OpenSSL
@@ -149,6 +150,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libtool \
     libconfig-dev \
     libpopt-dev \
+    libplist-dev \
+    libplist-utils \
+    libsodium-dev \
+    libgcrypt20-dev \
+    uuid-dev \
+    xxd \
     && rm -rf /var/lib/apt/lists/*
 
 # Tags are mutable, so the fetched tag is verified against the pinned SHA. Renovate bumps
@@ -176,6 +183,7 @@ RUN set -x \
         --without-dns-sd \
         --with-ssl=openssl \
         --with-stdout \
+        --with-airplay-2 \
         --sysconfdir=/etc \
     && make -j$(nproc) \
     && strip shairport-sync \
@@ -256,6 +264,7 @@ RUN set -x \
         # AirPlay receiver dependencies (shairport-sync)
         libconfig11 \
         libpopt0 \
+        libplist-2.0-4 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && rm -f \
@@ -336,7 +345,8 @@ COPY --from=pyav-builder /wheels/ /usr/local/share/pyav-wheels/
 
 # Verify FFmpeg, shairport-sync and the custom PyAV wheel with all codec runtime libraries
 # available.
-RUN ldconfig && ffmpeg -version && ffprobe -version && shairport-sync --version \
+RUN ldconfig && ffmpeg -version && ffprobe -version \
+    && shairport-sync --version | tee /dev/stderr | grep -q -- "-AirPlay2-smi11-" \
     && python -m pip install --no-cache-dir --no-index --no-deps \
         --target /tmp/pyav-check /usr/local/share/pyav-wheels/av*.whl \
     && PYTHONPATH=/tmp/pyav-check python -c "import av; print(av.library_versions)" \
