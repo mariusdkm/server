@@ -14,7 +14,7 @@ from music_assistant.providers.airplay.constants import (
     PTP_DAEMON_WARN_BURST,
     PTP_DAEMON_WARN_WINDOW,
 )
-from music_assistant.providers.airplay.ptp_daemon import PtpDaemon
+from music_assistant.providers.airplay.ptp_daemon import PTP_DAEMON_EXIT_NQPTP, PtpDaemon
 
 if TYPE_CHECKING:
     import pytest
@@ -28,6 +28,7 @@ DAEMON_UP_LINE = (
     "[15:44:56.101] ap2_ptp_run_daemon:1467 [PTP] daemon up: engine on 319/320, "
     "clock in /cliairplay-ptp, control on 127.0.0.1:9010"
 )
+DAEMON_UP_NQPTP_LINE = DAEMON_UP_LINE + ", nqptp=on"
 TRACE_LINE = "[15:44:56.101] [PTP] slave offset seq=7 error=0.000012"
 
 
@@ -80,11 +81,12 @@ def _live_process() -> MagicMock:
 
 
 @contextmanager
-def _spawn(*processes: MagicMock) -> Iterator[MagicMock]:
+def _spawn(*processes: MagicMock, help_text: bytes = b"--nqptp-compat") -> Iterator[MagicMock]:
     """Patch the binary lookup and process spawn; yield the AsyncProcess class mock."""
     side_effect: Any = list(processes) if processes else lambda *_a, **_k: _live_process()
     with (
         patch(f"{MODULE}.get_cli_binary", AsyncMock(return_value="/bin/cliairplay")),
+        patch(f"{MODULE}.check_output", AsyncMock(return_value=(0, help_text))),
         patch(f"{MODULE}.AsyncProcess", side_effect=side_effect) as process_cls,
     ):
         yield process_cls
@@ -237,6 +239,78 @@ async def test_last_release_unregisters_from_the_timeline_clock() -> None:
     _mass_of(daemon).create_task.assert_not_called()
 
 
+# --- nqptp compatibility ------------------------------------------------------------
+
+
+async def test_nqptp_holder_restarts_a_daemon_without_it() -> None:
+    """A holder that needs nqptp compatibility gets it, once."""
+    daemon = _daemon()
+    with _spawn() as process_cls:
+        await daemon.acquire("airplay", daemon.logger)
+        first = _process_of(daemon)
+        await daemon.acquire("airplay_receiver", daemon.logger, nqptp_compat=True)
+        await daemon.acquire("other", daemon.logger)
+
+    assert process_cls.call_count == 2
+    assert "--nqptp-compat" not in process_cls.call_args_list[0].args[0]
+    assert "--nqptp-compat" in process_cls.call_args_list[1].args[0]
+    first.close.assert_awaited_once()
+
+    # Releasing the nqptp holder does not restart the daemon again.
+    with _spawn() as process_cls:
+        await daemon.release("airplay_receiver")
+    process_cls.assert_not_called()
+    assert daemon.running
+
+
+async def test_nqptp_holder_first_starts_with_it() -> None:
+    """A daemon started for an nqptp holder starts with compatibility."""
+    daemon = _daemon()
+    with _spawn() as process_cls:
+        await daemon.acquire("airplay_receiver", daemon.logger, nqptp_compat=True)
+        await daemon.acquire("airplay", daemon.logger)
+    assert process_cls.call_count == 1
+    assert "--nqptp-compat" in process_cls.call_args.args[0]
+
+
+async def test_old_binary_without_nqptp_compat() -> None:
+    """A cliairplay without --nqptp-compat runs the daemon without it."""
+    daemon = _daemon()
+    with _spawn(help_text=b"--ptp-daemon") as process_cls:
+        await daemon.acquire("airplay_receiver", daemon.logger, nqptp_compat=True)
+    assert "--nqptp-compat" not in process_cls.call_args.args[0]
+
+
+async def test_new_timeline_rate_keeps_nqptp_compatibility() -> None:
+    """A daemon restarted on a new rate keeps standing in for nqptp."""
+    daemon = _daemon()
+    clock: TimelineClock = daemon.mass.timeline_clock
+    with _spawn():
+        await daemon.acquire("airplay_receiver", daemon.logger, nqptp_compat=True)
+    _eager_tasks(daemon)
+
+    with _spawn() as process_cls:
+        clock.set_rate(857_000)
+        assert daemon._restart_task is not None
+        await daemon._restart_task
+
+    assert "--nqptp-compat" in process_cls.call_args.args[0]
+
+
+async def test_nqptp_active_only_when_the_ready_line_says_so() -> None:
+    """Readiness reports whether the daemon stands in for nqptp."""
+    daemon = _daemon()
+    daemon._process = _live_process()
+    daemon._ready = asyncio.Event()
+    daemon._handle_line(DAEMON_UP_LINE)
+    assert daemon.ready
+    assert not daemon.nqptp_active
+
+    daemon._ready.clear()
+    daemon._handle_line(DAEMON_UP_NQPTP_LINE)
+    assert daemon.nqptp_active
+
+
 # --- readiness and output ------------------------------------------------------------
 
 
@@ -334,6 +408,45 @@ def test_restart_gets_a_fresh_warning_budget(caplog: pytest.LogCaptureFixture) -
     messages = [record.getMessage() for record in caplog.records]
     assert any("2 further problem line(s) from the previous daemon" in m for m in messages)
     assert any("Cannot bind UDP 319" in m for m in messages)
+
+
+async def test_taken_nqptp_port_keeps_ptp_without_compat() -> None:
+    """With a real nqptp on the host, the daemon restarts for the sender only."""
+    daemon = _daemon()
+    daemon._holders = {"airplay_receiver": True}
+    daemon._compat = True
+    process = MagicMock()
+    process.wait = AsyncMock(return_value=PTP_DAEMON_EXIT_NQPTP)
+    daemon._process = process
+    daemon._started = time.monotonic()
+    daemon.logger = logger = MagicMock()
+
+    with patch.object(daemon, "_start", new_callable=AsyncMock) as restart:
+        await daemon._monitor(process)
+
+    restart.assert_awaited_once_with(False)
+    assert not daemon._wants_compat()
+    assert "9000" in logger.warning.call_args.args[0]
+
+
+async def test_crash_restarts_once_with_the_same_mode() -> None:
+    """A crash after startup restarts the daemon once, keeping nqptp compatibility."""
+    daemon = _daemon()
+    daemon._compat = True
+    daemon.logger = MagicMock()
+
+    def _crashed() -> MagicMock:
+        process = MagicMock()
+        process.wait = AsyncMock(return_value=1)
+        daemon._process = process
+        daemon._started = time.monotonic() - 60
+        return process
+
+    with patch.object(daemon, "_start", new_callable=AsyncMock) as restart:
+        await daemon._monitor(_crashed())
+        restart.assert_awaited_once_with(True)
+        await daemon._monitor(_crashed())
+    restart.assert_awaited_once()
 
 
 async def test_bind_failure_degrades_without_restart() -> None:
