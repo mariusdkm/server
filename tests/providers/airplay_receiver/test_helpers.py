@@ -23,6 +23,11 @@ _BINARY = "/usr/local/bin/shairport-sync"
             id="homebrew",
         ),
         pytest.param("5.7-dev-12-gabcdef0-FFmpeg-OpenSSL-pipe-metadata", id="development"),
+        # the configuration runs an AirPlay 2 build as classic AirPlay
+        pytest.param(
+            "5.6.3-AirPlay2-smi11-FFmpeg-OpenSSL-stdout-pipe-metadata-sysconfdir:/etc",
+            id="airplay2",
+        ),
     ],
 )
 async def test_a_recent_build_with_metadata_support_is_used(version: str) -> None:
@@ -41,11 +46,6 @@ async def test_a_recent_build_with_metadata_support_is_used(version: str) -> Non
         pytest.param("5.6.3-FFmpeg-OpenSSL-stdout-pipe-sysconfdir:/etc", id="no-metadata"),
         # PipeWire is an output backend of its own, not the audio pipe
         pytest.param("5.6.3-FFmpeg-OpenSSL-ALSA-PipeWire-metadata-sysconfdir:/etc", id="no-pipe"),
-        # an AirPlay 2 build pipes 48 kHz 32-bit audio
-        pytest.param(
-            "5.6.3-AirPlay2-smi11-OpenSSL-Avahi-ALSA-stdout-pipe-soxr-metadata-sysconfdir:/etc",
-            id="airplay2",
-        ),
         # a build from a git checkout without tags reports its commit instead of a version
         pytest.param("7ce90d8-FFmpeg-OpenSSL-stdout-pipe-metadata-sysconfdir:/etc", id="commit"),
     ],
